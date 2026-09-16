@@ -31,11 +31,12 @@ from helion_mlir.custom_op import broadcast  # registers the op with Helion's de
 def _mamba_chunk_scan(
     cb: torch.Tensor,
     x: torch.Tensor,
-    dt: torch.Tensor,
-    dA_cumsum: torch.Tensor,
+    dt_k: torch.Tensor,
+    dA_cumsum_m: torch.Tensor,
+    dA_cumsum_k: torch.Tensor,
     C: torch.Tensor,
     prev_states: torch.Tensor,
-    D: torch.Tensor,
+    xD: torch.Tensor,
 ) -> torch.Tensor:
     """
     Argument:
@@ -45,7 +46,7 @@ def _mamba_chunk_scan(
         dA_cumsum: (batch, nheads, nchunks, chunk_size)
         C: (batch, seqlen, ngroups, dstate)
         prev_states: (batch, nchunks, nheads, headdim, dstate)
-        D: (nheads,)
+        xD: (batch, seqlen, nheads, headdim)  -- x already scaled by D[h]
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
@@ -62,23 +63,29 @@ def _mamba_chunk_scan(
 
     assert cb.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
     assert x.shape == (batch, seqlen, nheads, headdim)
-    assert dt.shape == (batch, nheads, nchunks, chunk_size)
-    assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
+    # Loom requires L1 allocations of rank >= 2, so the per-chunk vectors carry an
+    # explicit singleton dim. m-varying values need [tile_m, 1] and k-varying ones
+    # need [1, tile_k], which one layout cannot provide without a transpose (and
+    # transpose has no hw_spec kernel), hence two views of the same data.
+    assert dt_k.shape == (batch, nheads, nchunks, 1, chunk_size)
+    assert dA_cumsum_m.shape == (batch, nheads, nchunks, chunk_size, 1)
+    assert dA_cumsum_k.shape == (batch, nheads, nchunks, 1, chunk_size)
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert prev_states.shape == (batch, nchunks, nheads, headdim, dstate)
-    assert D.shape == (nheads,)
+    assert xD.shape == x.shape
     x = x.transpose(1, 2)
+    xD = xD.transpose(1, 2)
     C = C.transpose(1, 2)
 
     dtype = cb.dtype
     accum_dtype = torch.float16
     assert (
         x.dtype
-        == dt.dtype
-        == dA_cumsum.dtype
+        == dt_k.dtype
+        == dA_cumsum_m.dtype
         == C.dtype
         == prev_states.dtype
-        == D.dtype
+        == xD.dtype
         == dtype
     )
     prev_states_T = prev_states.transpose(3, 4)
@@ -97,8 +104,8 @@ def _mamba_chunk_scan(
                 # tile_b: batch tile (size 1)
                 # tile_c: chunk id tile (size 1)
                 acc_o = hl.zeros([tile_m, tile_n], dtype=accum_dtype)
-                # dA_cumsum_local_m: [tile_m]
-                dA_cumsum_local_m = dA_cumsum[tile_b.begin, tile_h.begin, tile_c.begin, tile_m]
+                # dA_cumsum_local_m: [tile_m, 1]  (rank 2 for the L1 estimator)
+                dA_cumsum_local_m = dA_cumsum_m[tile_b.begin, tile_h.begin, tile_c.begin, tile_m, :]
                 dA_cumsum_local_m_bc_n = broadcast(
                     dA_cumsum_local_m,
                     1,
@@ -137,22 +144,21 @@ def _mamba_chunk_scan(
                         tile_m,
                         tile_k,
                     ]
-                    # dA_cumsum_local_k: [tile_k]
-                    dA_cumsum_local_k = dA_cumsum[
-                        tile_b.begin, tile_h.begin, tile_c.begin, tile_k
+                    # dA_cumsum_local_k: [1, tile_k]
+                    dA_cumsum_local_k = dA_cumsum_k[
+                        tile_b.begin, tile_h.begin, tile_c.begin, :, tile_k
                     ]
                     dA_cumsum_local_m_bc_k = broadcast(
                         dA_cumsum_local_m,
                         1,
                         [dA_cumsum_local_m.size(0), tile_k],
                     )
-                    dA_cumsum_local_k = broadcast(dA_cumsum_local_k, 0, [tile_m, dA_cumsum_local_k.size(0)])
+                    dA_cumsum_local_k = broadcast(dA_cumsum_local_k, 0, [tile_m, dA_cumsum_local_k.size(1)])
                     # broadcast to [tile_m, tile_k]
                     cb_local *= torch.exp(dA_cumsum_local_m_bc_k - dA_cumsum_local_k)
-                    # dt_local: [tile_k]
-                    dt_local = dt[tile_b.begin, tile_h.begin, tile_c.begin, tile_k]
-                    # dt_local[None, :]: [1, tile_k], broadcast over tile_m axis
-                    dt_local = broadcast(dt_local, 0, [tile_m, dt_local.size(0)])
+                    # dt_local: [1, tile_k], broadcast over the tile_m axis
+                    dt_local = dt_k[tile_b.begin, tile_h.begin, tile_c.begin, :, tile_k]
+                    dt_local = broadcast(dt_local, 0, [tile_m, dt_local.size(1)])
                     cb_local *= dt_local
                     # Yet not support sparse matmul
                     # pred = (tile_m.index + 0)[:, None] >= (tile_k.index + 0)[None, :]
@@ -167,14 +173,12 @@ def _mamba_chunk_scan(
                     # hl.dot([tile_m, tile_k], [tile_k, tile_n]) -> [tile_m, tile_n]
                     acc_o = torch.addmm(acc_o, cb_local, x_local)
 
-                # D_local: scalar
-                D_local = D[tile_h.begin]
-                # x_residual: [tile_m, tile_n]
-                x_residual = x[
+                # D folded into x on the host (xD = x * D[h]); a rank-0 scalar read
+                # here produced a degenerate subview the memory analysis rejects.
+                x_residual = xD[
                     tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
                 ]
-                # D_local scalar broadcasts to [tile_m, tile_n]
-                acc_o += x_residual * D_local
+                acc_o += x_residual
                 # out[...] tile: [tile_m, tile_n]
                 out_[
                     tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
@@ -227,16 +231,17 @@ class MambaChunkScan(LoomKernel):
             dtype=torch.float16,
         )
         x = torch.empty([cls.BATCH, cls.SEQLEN, cls.NHEADS, cls.HEADDIM], dtype=torch.float16)
-        dt = torch.empty([cls.BATCH, cls.NHEADS, nchunks, cls.CHUNK_SIZE], dtype=torch.float16)
-        dA_cumsum = torch.empty([cls.BATCH, cls.NHEADS, nchunks, cls.CHUNK_SIZE], dtype=torch.float16)
+        dt_k = torch.empty([cls.BATCH, cls.NHEADS, nchunks, 1, cls.CHUNK_SIZE], dtype=torch.float16)
+        dA_cumsum_m = torch.empty([cls.BATCH, cls.NHEADS, nchunks, cls.CHUNK_SIZE, 1], dtype=torch.float16)
+        dA_cumsum_k = torch.empty([cls.BATCH, cls.NHEADS, nchunks, 1, cls.CHUNK_SIZE], dtype=torch.float16)
         C = torch.empty([cls.BATCH, cls.SEQLEN, cls.NGROUPS, cls.DSTATE], dtype=torch.float16)
         prev_states = torch.empty(
             [cls.BATCH, nchunks, cls.NHEADS, cls.HEADDIM, cls.DSTATE],
             dtype=torch.float16,
         )
-        D = torch.empty([cls.NHEADS], dtype=torch.float16)
+        xD = torch.empty([cls.BATCH, cls.SEQLEN, cls.NHEADS, cls.HEADDIM], dtype=torch.float16)
 
-        return (cb, x, dt, dA_cumsum, C, prev_states, D)
+        return (cb, x, dt_k, dA_cumsum_m, dA_cumsum_k, C, prev_states, xD)
 
 
 if __name__ == "__main__":

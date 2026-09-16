@@ -1,0 +1,4 @@
+{
+  "output_path": "test/mamba/solved/L1920_N32_H128_G4_D128_C192",
+  "hw_spec": "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x12y10.mlir"
+}
