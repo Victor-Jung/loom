@@ -70,10 +70,23 @@ def test_vector_slice_alloc_is_present(bufferized_ir: str) -> None:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="vector-slice loads are not yet entered into "
-                                       "the buffer coloring plan, so they get no "
-                                       "loom.semaphore_take and TT codegen rejects them")
 def test_every_alloc_is_bound(bufferized_ir: str) -> None:
-    """Every loom.alloc needs at least one loom.semaphore_take or host CB
-    emission fails. Currently the [n, 1] vector allocation is unbound."""
-    assert len(ALLOC.findall(bufferized_ir)) <= len(TAKE.findall(bufferized_ir))
+    """Every loom.alloc needs at least one loom.semaphore_take, or TT codegen
+    fails with "host CB emission requires at least one explicit
+    loom.semaphore_take for each loom.alloc".
+
+    The vector-slice allocation used to be unbound. deriveTensorSizes() in
+    canonical_bufferization_to_loom_pass dropped every static-1 dim when
+    computing sizes from a subview, so for a [1,1,1,?,1] subview producing
+    memref<?x1xf16> it produced one size against a rank-2 result. The rank
+    check then rejected the op, leaving it as a generic
+    bufferization.to_tensor. Memory binding only matches
+    loom.bufferize_to_tensor, so the load was never bound and its
+    semaphore_take was dead-code eliminated.
+    """
+    n_alloc = len(ALLOC.findall(bufferized_ir))
+    n_take = len(TAKE.findall(bufferized_ir))
+    assert n_alloc <= n_take, (
+        f"{n_alloc} loom.alloc but only {n_take} loom.semaphore_take: "
+        "some allocation was never bound to a buffer"
+    )
