@@ -1,0 +1,4 @@
+{
+  "output_path": "test/fig9/M256_N2048_K256",
+  "hw_spec": "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x8y10.mlir"
+}

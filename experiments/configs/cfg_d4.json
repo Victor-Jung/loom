@@ -1,0 +1,4 @@
+{
+  "output_path": "test/fuse/d4/M4096_N4096_K128",
+  "hw_spec": "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x12y10.mlir"
+}
