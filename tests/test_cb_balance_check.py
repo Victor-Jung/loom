@@ -57,3 +57,16 @@ def test_checker_never_raises() -> None:
     """It is advisory: a pathological kernel must still return, not abort."""
     errors, warnings = sk.check_cb_balance(["cb_pop_front(cb_id_binding9, 1);\n"] * 5, "compute.cpp")
     assert len(errors) == 1
+
+
+def test_cb_passed_to_a_helper_is_not_reported() -> None:
+    """The wait happens inside the helper under the parameter's name, so the
+    call-site pop looks unwaited. This is how the check first mis-diagnosed
+    mamba's binding4/binding5, which are in fact correctly paired."""
+    src = [
+        "loom_unary_bcast_block(cb_id_binding5, cb_id_internal4, v3, v1, KIND);\n",
+        "cb_pop_front(cb_id_binding5, v3);\n",
+    ]
+    errors, warnings = sk.check_cb_balance(src, "compute.cpp")
+    assert errors == [], errors
+    assert warnings == []
