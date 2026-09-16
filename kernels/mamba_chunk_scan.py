@@ -101,9 +101,9 @@ def _mamba_chunk_scan(
                 dA_cumsum_local_m = dA_cumsum[tile_b.begin, tile_h.begin, tile_c.begin, tile_m]
                 dA_cumsum_local_m_bc_n = broadcast(
                     dA_cumsum_local_m,
-                    0,
-                    [tile_n, dA_cumsum_local_m.size(0)],
-                ).T
+                    1,
+                    [dA_cumsum_local_m.size(0), tile_n],
+                )
 
                 # scale_m_local: [tile_m, tile_n]
                 scale_m_local = torch.exp(dA_cumsum_local_m_bc_n)
@@ -124,7 +124,11 @@ def _mamba_chunk_scan(
                 acc_o = hl.dot(C_local, prev_states_local, acc=acc_o)
                 acc_o *= scale_m_local
 
-                for tile_k in hl.tile((tile_m.id + 1) * block_m, block_size=block_k):
+                # NOTE: original bound was (tile_m.id + 1) * block_m, a data-dependent
+                # trip count that Loom cannot trace (affine.apply in trip-count chain).
+                # Static full-chunk bound instead: this makes the intra-chunk term
+                # NON-causal rather than block-causal, a real semantic change.
+                for tile_k in hl.tile(chunk_size, block_size=block_k):
                     # cb_local: [tile_m, tile_k]
                     cb_local = cb[
                         tile_b.begin,
@@ -139,9 +143,9 @@ def _mamba_chunk_scan(
                     ]
                     dA_cumsum_local_m_bc_k = broadcast(
                         dA_cumsum_local_m,
-                        0,
-                        [tile_k, dA_cumsum_local_m.size(0)],
-                    ).T
+                        1,
+                        [dA_cumsum_local_m.size(0), tile_k],
+                    )
                     dA_cumsum_local_k = broadcast(dA_cumsum_local_k, 0, [tile_m, dA_cumsum_local_k.size(0)])
                     # broadcast to [tile_m, tile_k]
                     cb_local *= torch.exp(dA_cumsum_local_m_bc_k - dA_cumsum_local_k)
