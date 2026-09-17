@@ -1,8 +1,9 @@
 # Why mamba_chunk_scan hangs on Blackhole
 
-Three defects, established on a p150a (13x10 grid, tt-metal `ad07818`). The first
-two are blockers; the third is a coverage gap. All three are present in the
-repository's own solved configuration
+Three defects, established on a p150a (13x10 grid, tt-metal `ad07818`). The
+first two were blockers and are now **fixed in the compiler**; the third is a
+coverage gap and is still open. All three are present in the repository's own
+solved configuration
 (`test/mamba/solved/L1920_N32_H128_G4_D128_C192`), so none of them depend on
 local edits to `kernels/mamba_chunk_scan.py`.
 
@@ -39,10 +40,12 @@ These are emitted as raw `noc_async_read`, not `noc_async_read_tile`. Flash
 attention contains **zero** such reads (tile reads are 2048 bytes and therefore
 always congruent); the paper's mamba config contains 14, and the small config 26.
 
-*Fix belongs in* the TTKernel lowering that emits raw sub-tile DRAM reads.
-`experiments/scripts/apply_noc_shim.py` is a working reference: it reads the
-64B-aligned superset into the (>=512B, 64B-aligned) destination slot and shifts
-the wanted bytes down in place.
+**Fixed** in `third_party/loom2ttkernel/split_kernel.py`: raw sub-tile reads are
+routed through a `loom_read_congruent` shim that reads the aligned 64-byte
+superset into the destination slot (itself 64B-aligned and at least 512B wide)
+and shifts the wanted bytes down in place. Reads that are already congruent go
+straight through, and kernels that read only whole tiles get no helper at all.
+Covered by `tests/test_dram_read_congruence.py`.
 
 ## 2. One L1 buffer assigned to two simultaneously-live tensors
 
@@ -76,13 +79,21 @@ Confirmed in the paper's own config: `cb_id_internal4` has `reserve=1 push=1`
 plus one `loom_unary_bcast_block` writing into it (which reserves and pushes
 internally) = two pushes, against `pop=1`.
 
-Separating the buffers (`experiments/scripts/fix_cb_alias_mlir.py`) removes the
-deadlock: the kernel completes, and the slice it computes matches the reference
-at **PCC 0.986** (slope 0.973, vs `causal=element`).
+**Fixed** in `third_party/loom-dataflow/lib/passes/tt-opt/src/split_binary_scalar_chain_pass.cpp`:
+`splitBinaryScalarChain` now detects when one of the second half's inputs shares
+storage with the destination and gives the intermediate its own `loom.alloc`,
+redirecting the chain's downstream consumers to it. Detection follows only
+destination-passing inits and views, so two values compare equal exactly when
+they share storage -- the pre-existing `traceToRootAllocOp` walks *all* operands
+and would report whichever alloc it reached first.
 
-*Fix belongs in* the pass that splits the fused elementwise op; the intermediate
-needs its own allocation. `loom.broadcast`'s bufferization model is correct
-(`result == init`, Equivalent/definite) and is not at fault.
+`loom.broadcast`'s bufferization model is correct (`result == init`,
+Equivalent/definite) and was never at fault; the pass runs after bufferization
+and introduced the aliasing directly.
+
+With the fix the kernel completes instead of hanging, and the slice it computes
+matches the reference at **PCC 0.986** (vs `causal=element`). Covered by
+`tests/test_split_chain_alias.py`.
 
 ## 3. Batch and head dimensions are never swept
 
@@ -113,25 +124,37 @@ The paper's solved config has the same `tile_b=2`/`tile_h=32` collapse and a
 similarly shallow nest (grid 6x10 plus one `scf.for 0..2`). Its coverage has not
 been measured on device.
 
-## Reproducing
+## Running it
+
+Both fixes are in the compiler, so the normal flow is enough. The IRs under
+`test/` are generated artifacts (gitignored); regenerate `p03` from the cached
+`p01_explored.mlir` plus the solved block sizes in `constraints/solver.log`, then
+lower and run:
 
 ```sh
-# 1. separate the aliased buffers in the bufferized IR
-experiments/scripts/fix_cb_alias_mlir.py \
-    test/mamba/small/IRs/p03_bufferized.mlir test/mamba/small/IRs/p03_fixed.mlir
-
-# 2. lower it
-SPLIT_KERNEL_OUTPUT_DIR=$PWD/tmp_output/k_mamba_fixed \
-    ./third_party/loom2ttkernel/lower.sh test/mamba/small/IRs/p03_fixed.mlir 1
-
-# 3. make the sub-tile DRAM reads congruent on Blackhole
-experiments/scripts/apply_noc_shim.py tmp_output/k_mamba_fixed/reader.cpp
-
-# 4. stage and run
-cp tmp_output/k_mamba_fixed/{reader,compute,writer}.cpp \
+SPLIT_KERNEL_OUTPUT_DIR=$PWD/tmp_output/k_mamba \
+    ./third_party/loom2ttkernel/lower.sh test/mamba/small/IRs/p03_bufferized.mlir 1
+cp tmp_output/k_mamba/{reader,compute,writer}.cpp \
    $TT_METAL_HOME/tt_metal/programming_examples/mlir_matmul_simple/kernels/
-python experiments/host/mamba_verify.py --kernels tmp_output/k_mamba_fixed \
-    --ir test/mamba/small/IRs/p03_fixed.mlir --causal element
+python experiments/host/mamba_verify.py --kernels tmp_output/k_mamba \
+    --ir test/mamba/small/IRs/p03_bufferized.mlir --causal element
+```
+
+`experiments/scripts/fix_cb_alias_mlir.py` and `apply_noc_shim.py` remain as the
+standalone reproductions used to isolate each defect before either was fixed;
+they are not needed by the normal flow.
+
+Note that `loom-dataflow` is installed into `.venv` as a scikit-build-core
+editable package that does **not** rebuild on import, so a change to a pass needs
+an explicit reinstall before the Python pipeline picks it up:
+
+```sh
+SKBUILD_BUILD_DIR=$PWD/third_party/loom-dataflow/build-py310 \
+uv pip install --no-deps --no-build-isolation --force-reinstall \
+  --config-settings=cmake.define.ADLDialect_DIR=$PWD/third_party/adl-dialect/build/install/lib/cmake/ADLDialect \
+  --config-settings=cmake.define.MLIR_DIR=/opt/ttmlir-toolchain/lib/cmake/mlir \
+  --config-settings=cmake.define.LLVM_DIR=/opt/ttmlir-toolchain/lib/cmake/llvm \
+  -e third_party/loom-dataflow
 ```
 
 Run under `TT_METAL_WATCHER=1` to turn a NOC violation into a named error instead
