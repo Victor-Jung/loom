@@ -113,6 +113,11 @@ try:
     good = [i for i,c in enumerate(cc) if c > 0.9]
     print(f"  per-(b,h) PCC: min {min(cc):.3f} median {_s.median(cc):.3f} max {max(cc):.3f}; "
           f"{len(good)}/{len(cc)} rows >0.9")
+    weak = sorted(((c, i) for i, c in enumerate(cc) if c <= 0.9))[:6]
+    if weak:
+        H_ = got.shape[1]
+        print("  weakest rows (b,h): " + ", ".join(
+            f"({i // H_},{i % H_})={c:.3f}" for c, i in weak))
     print(f"  PCC {pcc:.6f}   max|err|/max|ref| {((got-ref).abs().max()/denom).item():.4f}")
     print("  PASS" if pcc > 0.99 else "  FAIL")
 finally:

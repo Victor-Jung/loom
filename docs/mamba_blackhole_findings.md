@@ -1,8 +1,8 @@
 # Why mamba_chunk_scan hangs on Blackhole
 
 Three defects, established on a p150a (13x10 grid, tt-metal `ad07818`). The
-first two were blockers and are now **fixed in the compiler**; the third is a
-coverage gap and is still open. All three are present in the repository's own
+first two were blockers and are now **fixed in the compiler**; the third was a
+coverage gap and is **fixed in the kernel**. All three are present in the repository's own
 solved configuration
 (`test/mamba/solved/L1920_N32_H128_G4_D128_C192`), so none of them depend on
 local edits to `kernels/mamba_chunk_scan.py`.
@@ -95,34 +95,80 @@ With the fix the kernel completes instead of hanging, and the slice it computes
 matches the reference at **PCC 0.986** (vs `causal=element`). Covered by
 `tests/test_split_chain_alias.py`.
 
-## 3. Batch and head dimensions are never swept
+## 3. Batch and head dimensions were never swept
 
-The program writes 12 of 768 output tiles (measured: 98.4% of the output is
-zero). This is *not* a host defect -- the generated host issues a single
-`ttnn.generic_op`, exactly as every other Loom kernel does, and flash attention
-covers its entire output that way (PCC 0.994 on positions sampled at random
-across a `[128, 15360, 512]` output).
+The program wrote 12 of 768 output tiles -- 98.4% of the output was zero. This
+was *not* a host defect: the generated host issues a single `ttnn.generic_op`
+exactly as every other Loom kernel does, and flash attention covers its entire
+output that way (PCC 0.994 on positions sampled at random across a
+`[128, 15360, 512]` output). Coverage comes from the core grid plus per-core
+loops, and mamba had none:
 
-Coverage normally comes from the core grid plus per-core loops:
-
-| | flash attention | mamba (small) |
+| | flash attention | mamba (before) |
 |---|---|---|
 | grid | `scf.parallel (10,12)` = 120 cores | `scf.parallel (6,2)` = 12 cores |
 | per-core loops | `for 0..13`, `for 0..40`, `for 0..480` | none |
 | writer | 4 loops around the write | 0 loops, 1 write |
 
-The Helion source does have `for tile_b in hl.tile(batch)` and
-`for tile_h in hl.tile(nheads)`, and the solved config sets `tile_b=2`,
-`tile_h=32` -- one tile spanning the *entire* batch and head extent. Those loops
-therefore become single-trip and fold away, but the body is emitted for a single
-element rather than for the whole tile. The generated reader contains no batch or
-head stride arithmetic at all (only `6144`, the chunk stride *within* one (b,h)
-slice), so no choice of base address would let a relaunch reach a different head:
-making the host launch repeatedly could not fix this as the code stands.
+For every tiled dimension the frontend emits a trip count of
+`ceil(extent / tile_X)`, a per-iteration offset of `arg * tile_X`, and a slice.
+For `m` and `n` the slice extent *is* `tile_X`, so striding by `tile_X` covers
+the dimension. For batch and head the extent is hardcoded to **1**, because the
+kernel indexes them with `.begin`, a scalar:
 
-The paper's solved config has the same `tile_b=2`/`tile_h=32` collapse and a
-similarly shallow nest (grid 6x10 plus one `scf.for 0..2`). Its coverage has not
-been measured on device.
+```python
+dA_cumsum_m[tile_b.begin, tile_h.begin, tile_c.begin, tile_m, :]
+```
+
+Those loops therefore stride by `tile_X` while consuming one element, and are
+only correct when `tile_X == 1`. Nothing enforced that: the frontend advertised
+`@tile_b upper_bound = 2` and `@tile_h upper_bound = 32` -- the full extents --
+and the solver picked the maximum, because fewer iterations model as cheaper. It
+reported "Optimal T_total: 181" for a program doing 1/64 of the work.
+
+`tile_c` is the control: it is indexed by `.begin` identically and has an
+extent-1 slice identically, but its `hl.tile` call passed `block_size=1`, so its
+symbol was pinned, its loop ran `ceil(2/1) = 2` times and it covered both chunks
+correctly.
+
+**Fixed** in `kernels/mamba_chunk_scan.py` by pinning the two free tiles:
+
+```python
+for tile_b in hl.tile(batch, block_size=1):
+    for tile_h in hl.tile(nheads, block_size=1):
+```
+
+The frontend then reports `upper_bound = 1` for both, the solver's only choice
+is 1, and `p03` gains `scf.for 0..2` (batch) and `scf.for 0..32` (heads) inside
+the 6x2 grid: 12 x 2 x 32 = 768 tiles, the whole output. Covered by
+`tests/test_mamba_tile_domains.py`.
+
+Note the solver's cost for the correct program is 9,168 units against 181 for
+the broken one -- the old "optimum" was cheap precisely because it computed
+almost nothing.
+
+This is a kernel-level fix for a trap the frontend still allows. The general
+hardening is to derive a tile symbol's domain from how its induction variable is
+used: a tile consumed only via `.begin` can only ever have block size 1, and
+advertising the full extent hands the solver a domain in which almost every
+point silently computes a fraction of the answer. Any kernel using `.begin` on
+an unpinned `hl.tile` has the same trap. That generalization is not done.
+
+## Result
+
+From the fixed kernel, through the full pipeline, on a p150a:
+
+```
+got: mean -0.00010  std 0.53111  absmax 5.84375  zeros 0.0%
+ref: mean -0.00025  std 0.53328  absmax 5.87889  zeros 0.0%
+per-(b,h) PCC: min 0.815 median 0.987 max 0.999; 60/64 rows >0.9
+PCC 0.995254   max|err|/max|ref| 0.0666   PASS
+```
+
+The four rows below 0.9 are heads 9 and 22 in both batches. Those are the two
+smallest `|D[h]|` of 32 (0.097 and 0.135); since `xD = x * D[h]`, their outputs
+are the smallest in magnitude and carry the largest relative bf16 error. It is a
+property of the test data, not of the generated code.
 
 ## Running it
 

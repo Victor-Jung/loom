@@ -96,8 +96,13 @@ def _mamba_chunk_scan(
         [chunk_size, headdim, nchunks],
         block_size=[block_m, block_n, 1],
     ):
-        for tile_b in hl.tile(batch):
-            for tile_h in hl.tile(nheads):
+        # block_size=1 is load-bearing, not a default: both tiles are consumed
+        # below as `.begin`, a scalar index, so the slices they produce have
+        # extent 1. Leaving the block size free lets the solver pick the whole
+        # dimension -- the loop then strides by that block while still reading
+        # one element, silently computing only the first batch/head.
+        for tile_b in hl.tile(batch, block_size=1):
+            for tile_h in hl.tile(nheads, block_size=1):
                 # tile_h: head tile (size 1)
                 # tile_m: chunk-local sequence rows (M axis)
                 # tile_n: head-dim columns (N axis)
