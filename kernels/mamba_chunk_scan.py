@@ -42,8 +42,9 @@ def _mamba_chunk_scan(
     Argument:
         cb: (batch, nchunks, ngroups, chunk_size, chunk_size)
         x: (batch, seqlen, nheads, headdim)
-        dt: (batch, nheads, nchunks, chunk_size)
-        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+        dt_k: (batch, nheads, nchunks, 1, chunk_size)
+        dA_cumsum_m: (batch, nheads, nchunks, chunk_size, 1)
+        dA_cumsum_k: (batch, nheads, nchunks, 1, chunk_size)
         C: (batch, seqlen, ngroups, dstate)
         prev_states: (batch, nchunks, nheads, headdim, dstate)
         xD: (batch, seqlen, nheads, headdim)  -- x already scaled by D[h]
@@ -63,10 +64,8 @@ def _mamba_chunk_scan(
 
     assert cb.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
     assert x.shape == (batch, seqlen, nheads, headdim)
-    # Loom requires L1 allocations of rank >= 2, so the per-chunk vectors carry an
-    # explicit singleton dim. m-varying values need [tile_m, 1] and k-varying ones
-    # need [1, tile_k], which one layout cannot provide without a transpose (and
-    # transpose has no hw_spec kernel), hence two views of the same data.
+    # L1 allocations must be rank >= 2 and there is no transpose kernel, so the
+    # per-chunk vectors arrive as two views: [chunk_size, 1] and [1, chunk_size].
     assert dt_k.shape == (batch, nheads, nchunks, 1, chunk_size)
     assert dA_cumsum_m.shape == (batch, nheads, nchunks, chunk_size, 1)
     assert dA_cumsum_k.shape == (batch, nheads, nchunks, 1, chunk_size)
@@ -96,11 +95,8 @@ def _mamba_chunk_scan(
         [chunk_size, headdim, nchunks],
         block_size=[block_m, block_n, 1],
     ):
-        # block_size=1 is load-bearing, not a default: both tiles are consumed
-        # below as `.begin`, a scalar index, so the slices they produce have
-        # extent 1. Leaving the block size free lets the solver pick the whole
-        # dimension -- the loop then strides by that block while still reading
-        # one element, silently computing only the first batch/head.
+        # block_size=1 is required: both are indexed by `.begin`, so their slices
+        # have extent 1 while the loop strides by the block size.
         for tile_b in hl.tile(batch, block_size=1):
             for tile_h in hl.tile(nheads, block_size=1):
                 # tile_h: head tile (size 1)
@@ -136,10 +132,8 @@ def _mamba_chunk_scan(
                 acc_o = hl.dot(C_local, prev_states_local, acc=acc_o)
                 acc_o *= scale_m_local
 
-                # NOTE: original bound was (tile_m.id + 1) * block_m, a data-dependent
-                # trip count that Loom cannot trace (affine.apply in trip-count chain).
-                # Static full-chunk bound instead: this makes the intra-chunk term
-                # NON-causal rather than block-causal, a real semantic change.
+                # Static bound: the original (tile_m.id + 1) * block_m is a trip
+                # count Loom cannot trace. Makes the intra-chunk term non-causal.
                 for tile_k in hl.tile(chunk_size, block_size=block_k):
                     # cb_local: [tile_m, tile_k]
                     cb_local = cb[
@@ -178,8 +172,8 @@ def _mamba_chunk_scan(
                     # hl.dot([tile_m, tile_k], [tile_k, tile_n]) -> [tile_m, tile_n]
                     acc_o = torch.addmm(acc_o, cb_local, x_local)
 
-                # D folded into x on the host (xD = x * D[h]); a rank-0 scalar read
-                # here produced a degenerate subview the memory analysis rejects.
+                # xD = x * D[h], folded on the host: reading D[h] here gave a
+                # rank-0 subview the memory analysis rejects.
                 x_residual = xD[
                     tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
                 ]

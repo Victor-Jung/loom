@@ -1,12 +1,7 @@
-"""Matmul kernel for the Loom pipeline.
+"""Matmul with a depth-8 elementwise epilogue: log(exp(...)) four times over.
 
-Standalone CLI script. Run from the repo root:
-
-    python kernels/matmul.py --config kernels/config_files/matmul.json --njobs 16 --debug --topk-candidates 1 --topk-block-size 3
-
-This script inherits the full Loom CLI and pipeline from LoomKernel.
-To write your own kernel, copy this file, replace the kernel body
-and bind_args tensors, and keep the __main__ block unchanged.
+One of matmul_d{1,4,8}: the same GEMM with epilogue chains of increasing
+length, for the fusion-depth sweep. CLI as kernels/matmul.py.
 """
 
 from __future__ import annotations
@@ -22,10 +17,6 @@ from loom.loom_utils.kernel_size import resolve_kernel_shape_args
 
 
 def _matmul_d8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Matrix-multiply x @ y using helion tiling.
-
-    Kernel dimensions are determined at bind_args() time (M=4096, K=512, N=4096).
-    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2
@@ -39,12 +30,6 @@ def _matmul_d8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class MatmulD8(LoomKernel):
-    """Matmul kernel: computes C = A @ B for fixed (M, K, N) shapes.
-
-    Kernel dimensions (class-level constants, can be overridden in subclasses):
-        M=4096, K=512, N=4096
-    """
-
     kernel_name = "matmul_d8"
 
     M: int = 4096
@@ -52,9 +37,6 @@ class MatmulD8(LoomKernel):
     N: int = 4096
     assume_divisible: bool = True
 
-    # Assign the helion-decorated function as a class attribute.
-    # We cannot stack @staticmethod with @helion.kernel because the helion
-    # decorator returns a custom object, not a plain callable.
     kernel = helion.kernel(
         static_shapes=False,
         autotune_config_overrides={

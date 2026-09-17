@@ -1,22 +1,11 @@
-"""Matmul, VARIANT splitk: K is made partly SPATIAL and reduced across tiles.
+"""Matmul, variant splitk: K made partly spatial and reduced across tiles.
 
 The baseline keeps K as a sequential in-core reduction, so at large K each core
-streams the whole K extent for one output tile (worst reuse). Here K is tiled
-spatially and the partial accumulators are combined with the gather + tile.id==0
-idiom that mqa_decode uses for its split-KV reduction (Helion here has no
-atomic_add, so that is the supported way to express a cross-tile reduction).
+streams the whole K extent for one output tile. Here K is tiled spatially and
+the partials are combined with the gather + tile.id == 0 idiom from mqa_decode,
+Helion having no atomic_add.
 
-Original header follows.
-
-Matmul kernel for the Loom pipeline.
-
-Standalone CLI script. Run from the repo root:
-
-    python kernels/matmul.py --config kernels/config_files/matmul.json --njobs 16 --debug --topk-candidates 1 --topk-block-size 3
-
-This script inherits the full Loom CLI and pipeline from LoomKernel.
-To write your own kernel, copy this file, replace the kernel body
-and bind_args tensors, and keep the __main__ block unchanged.
+CLI as kernels/matmul.py.
 """
 
 from __future__ import annotations
@@ -33,10 +22,6 @@ from helion_mlir.custom_op import gather
 
 
 def _matmul_splitk(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Matrix-multiply x @ y using helion tiling.
-
-    Kernel dimensions are determined at bind_args() time (M=4096, K=512, N=4096).
-    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2
@@ -52,12 +37,6 @@ def _matmul_splitk(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class MatmulSplitK(LoomKernel):
-    """Matmul kernel: computes C = A @ B for fixed (M, K, N) shapes.
-
-    Kernel dimensions (class-level constants, can be overridden in subclasses):
-        M=4096, K=512, N=4096
-    """
-
     kernel_name = "matmul_splitk"
 
     M: int = 4096
@@ -65,9 +44,6 @@ class MatmulSplitK(LoomKernel):
     N: int = 4096
     assume_divisible: bool = True
 
-    # Assign the helion-decorated function as a class attribute.
-    # We cannot stack @staticmethod with @helion.kernel because the helion
-    # decorator returns a custom object, not a plain callable.
     kernel = helion.kernel(
         static_shapes=False,
         autotune_config_overrides={
