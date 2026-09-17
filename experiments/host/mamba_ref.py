@@ -9,8 +9,9 @@ NOTE ON SEMANTICS: kernels/mamba_chunk_scan.py has the causal mask commented
 out ("Yet not support sparse matmul") and its k-loop runs to
 (tile_m.id + 1) * block_m.  The kernel therefore computes a BLOCK-causal result
 that includes k > m terms inside m's own block, and the answer depends on
-block_m.  `causal="element"` is the true Mamba-2 chunk scan; `causal="block"`
-reproduces what the kernel actually computes.
+block_m.  `causal="element"` is the true Mamba-2 chunk scan; `causal="block"` is the
+original kernel; `causal="none"` is what the kernel computes once the dynamic
+trip count is replaced by a static chunk_size.
 """
 import torch
 
@@ -40,10 +41,18 @@ def mamba_ref(cb, x, dt, dA, C, prev_states, D, block_m, causal="block"):
             W = cbl * decay * dt_c.unsqueeze(1)                           # [B,m,k]
             if causal == "element":
                 mask = m_idx.unsqueeze(1) >= m_idx.unsqueeze(0)
-            else:  # block-causal, as the kernel implements
+                W = W * mask.to(W.dtype)
+            elif causal == "block":
                 kend = ((m_idx // block_m) + 1) * block_m
                 mask = m_idx.unsqueeze(0) < kend.unsqueeze(1)             # [m,k]
-            W = W * mask.to(W.dtype)
+                W = W * mask.to(W.dtype)
+            elif causal == "none":
+                # What the kernel computes after the dynamic trip count
+                # (tile_m.id + 1) * block_m was replaced by a static chunk_size:
+                # every k in the chunk contributes, so there is no mask at all.
+                pass
+            else:
+                raise ValueError(f"unknown causal mode {causal!r}")
             xc = xt[:, hh, c*CS:(c+1)*CS, :]                              # [B,CS,Dh]
             acc = acc + torch.einsum('bmk,bkn->bmn', W, xc)
             acc = acc + xc * D[hh].float()
