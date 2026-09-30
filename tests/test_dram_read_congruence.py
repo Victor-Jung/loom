@@ -62,3 +62,28 @@ def test_helper_block_is_self_contained() -> None:
     assert "loom_read_congruent" in block
     assert "noc_async_read_barrier();" in block   # bounce must complete before the shift
     assert "& 63u" in block                        # 64-byte phase on Blackhole
+
+
+def test_reused_temp_name_binds_to_nearest_preceding_definition() -> None:
+    """temp_NNN names are unique per block, not per file.
+
+    Keying a file-global map on the name let a later redefinition rewrite an
+    earlier read with the wrong accessor and page, emitting a variable that is
+    not in scope at the use site ("'v253' was not declared in this scope").
+    """
+    lines = [
+        "  uint64_t temp_766 = v85.get_noc_addr(v202 / v82, v202 % v82);\n",
+        "  noc_async_read(temp_766, v203, v14);\n",
+        "  uint64_t temp_766 = v114.get_noc_addr(v253 / v102, v253 % v102);\n",
+        "  noc_async_read(temp_766, v254, v14);\n",
+    ]
+    out, count = sk._apply_dram_read_congruence(lines)
+    assert count == 2
+    assert "loom_read_congruent(v85, v202 / v82, v202 % v82, v203, v14);" in out[1]
+    assert "loom_read_congruent(v114, v253 / v102, v253 % v102, v254, v14);" in out[3]
+
+
+def test_read_before_any_definition_is_left_alone() -> None:
+    lines = ["  noc_async_read(temp_1, dst, len);\n"]
+    out, count = sk._apply_dram_read_congruence(lines)
+    assert count == 0 and out == lines
