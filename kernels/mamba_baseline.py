@@ -1,3 +1,25 @@
+"""Hand-written TTNN mamba2 chunk-scan, used as the reference implementation.
+
+This defines the computation the Loom kernels must match -- including the D
+residual (x * D[h]), which it applies on device inside the scan.
+
+Driver: experiments/host/mamba_baseline_run.py
+"""
+
+import torch
+import ttnn
+
+
+
+def tt_slice(t, starts, ends):
+    """Rank-generic device slice: t[starts[i]:ends[i], ...] over every dim.
+
+    Referenced 16 times in this module but never defined -- the file had no
+    imports either, so it had never been executed.
+    """
+    return ttnn.slice(t, starts, ends)
+
+
 def prepare_mamba2_chunk_scan_x(x: torch.Tensor) -> torch.Tensor:
     """
     Match the layout Helion uses after x.transpose(1, 2).

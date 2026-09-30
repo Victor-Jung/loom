@@ -36,7 +36,7 @@ def _mamba_chunk_scan(
     dA_cumsum_k: torch.Tensor,
     C: torch.Tensor,
     prev_states: torch.Tensor,
-    xD: torch.Tensor,
+    D: torch.Tensor,
 ) -> torch.Tensor:
     """
     Argument:
@@ -47,7 +47,7 @@ def _mamba_chunk_scan(
         dA_cumsum_k: (batch, nheads, nchunks, 1, chunk_size)
         C: (batch, seqlen, ngroups, dstate)
         prev_states: (batch, nchunks, nheads, headdim, dstate)
-        xD: (batch, seqlen, nheads, headdim)  -- x already scaled by D[h]
+        D: (batch, nheads, chunk_size, headdim)  -- per-head scale, pre-replicated
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
@@ -71,9 +71,8 @@ def _mamba_chunk_scan(
     assert dA_cumsum_k.shape == (batch, nheads, nchunks, 1, chunk_size)
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert prev_states.shape == (batch, nchunks, nheads, headdim, dstate)
-    assert xD.shape == x.shape
+    assert D.shape == (batch, nheads, chunk_size, headdim)
     x = x.transpose(1, 2)
-    xD = xD.transpose(1, 2)
     C = C.transpose(1, 2)
 
     dtype = cb.dtype
@@ -84,7 +83,7 @@ def _mamba_chunk_scan(
         == dA_cumsum_m.dtype
         == C.dtype
         == prev_states.dtype
-        == xD.dtype
+        == D.dtype
         == dtype
     )
     prev_states_T = prev_states.transpose(3, 4)
@@ -134,6 +133,12 @@ def _mamba_chunk_scan(
 
                 # Static bound: the original (tile_m.id + 1) * block_m is a trip
                 # count Loom cannot trace. Makes the intra-chunk term non-causal.
+                D_local = D[tile_b.begin, tile_h.begin, tile_m, tile_n]
+                x_residual = x[
+                    tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
+                ]
+                acc_o += x_residual * D_local
+
                 for tile_k in hl.tile(chunk_size, block_size=block_k):
                     # cb_local: [tile_m, tile_k]
                     cb_local = cb[
@@ -172,12 +177,6 @@ def _mamba_chunk_scan(
                     # hl.dot([tile_m, tile_k], [tile_k, tile_n]) -> [tile_m, tile_n]
                     acc_o = torch.addmm(acc_o, cb_local, x_local)
 
-                # xD = x * D[h], folded on the host: reading D[h] here gave a
-                # rank-0 subview the memory analysis rejects.
-                x_residual = xD[
-                    tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
-                ]
-                acc_o += x_residual
                 # out[...] tile: [tile_m, tile_n]
                 out_[
                     tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
@@ -238,9 +237,9 @@ class MambaChunkScan(LoomKernel):
             [cls.BATCH, nchunks, cls.NHEADS, cls.HEADDIM, cls.DSTATE],
             dtype=torch.float16,
         )
-        xD = torch.empty([cls.BATCH, cls.SEQLEN, cls.NHEADS, cls.HEADDIM], dtype=torch.float16)
+        D = torch.empty([cls.BATCH, cls.NHEADS, cls.CHUNK_SIZE, cls.HEADDIM], dtype=torch.float16)
 
-        return (cb, x, dt_k, dA_cumsum_m, dA_cumsum_k, C, prev_states, xD)
+        return (cb, x, dt_k, dA_cumsum_m, dA_cumsum_k, C, prev_states, D)
 
 
 if __name__ == "__main__":
