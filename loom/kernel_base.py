@@ -225,6 +225,20 @@ class LoomKernel:
             metavar="K",
             help="Materialize K local block-size samples per symbol around each selected candidate.",
         )
+        parser.add_argument(
+            "--tune",
+            metavar="POLICY",
+            default=None,
+            help="Tune the stage-00 mapping program with this search policy before exploration "
+            "(e.g. identity, fixed).",
+        )
+        parser.add_argument(
+            "--tune-options",
+            dest="tune_options",
+            metavar="STR",
+            default=None,
+            help="Options for --tune; for 'fixed' the schedule, e.g. 'interchange(m,n)'.",
+        )
         return parser
 
     @classmethod
@@ -255,6 +269,8 @@ class LoomKernel:
         output_path = args.output_path or config_data.get("output_path")
         hw_spec = args.hw_spec or config_data.get("hw_spec") or config_data.get("df_mlir")
         block_sizes = config_data.get("block_sizes")
+        tune = args.tune or config_data.get("tune")
+        tune_options = args.tune_options or config_data.get("tune_options") or ""
         assigned_block_size = config_data.get("assigned_block_size")
 
         # Required parameter check
@@ -298,6 +314,8 @@ class LoomKernel:
             assigned_block_size=assigned_block_size if has_assigned_block_size else None,
             topk_candidates=args.topk_candidates,
             topk_block_size=args.topk_block_size,
+            tune=tune,
+            tune_options=tune_options,
         )
 
 

@@ -3,9 +3,10 @@
 
 Tensor shapes are read from the bufferized MLIR's func signature (authoritative),
 not guessed. Numerical validation is only possible where we know the reference
-semantics (matmul); otherwise we report that it ran and sanity-check the output.
+semantics (matmul, batched matmul, add, GEMM chain); otherwise we report that it ran and
+sanity-check the output.
 
-  python loom_run_generic.py --ir <p03_bufferized.mlir> [--kernels DIR] [--ref matmul]
+  python loom_run_generic.py --ir <p03_bufferized.mlir> [--kernels DIR] [--ref matmul|bmm|add|chain]
 """
 import argparse, importlib.util, re, sys
 from pathlib import Path
@@ -14,7 +15,9 @@ import torch, ttnn
 ap = argparse.ArgumentParser()
 ap.add_argument("--ir", required=True, help="p03_bufferized.mlir the kernels were lowered from")
 ap.add_argument("--kernels", default="/home/vicjung/loom/tmp_output/kernels")
-ap.add_argument("--ref", choices=["matmul", "none"], default="none")
+ap.add_argument("--ref", choices=["matmul", "bmm", "add", "chain", "none"], default="none")
+ap.add_argument("--block-pcc", type=int, default=0, metavar="N",
+                help="also print a PCC map over NxN blocks of the (2-D) output")
 a = ap.parse_args()
 
 host_py = Path(a.kernels) / "host_ttnn.py"
@@ -69,11 +72,26 @@ try:
     outs = out if isinstance(out, tuple) else (out,)
     got = [ttnn.to_torch(o).float() for o in outs]
 
-    if a.ref == "matmul" and len(shapes) == 3:
-        x = torch_in[order[0]]; y = torch_in[order[1]]
-        ref = x @ y
+    refs = {
+        "matmul": lambda t: t[0] @ t[1],
+        "bmm": lambda t: t[0] @ t[1],
+        "add": lambda t: t[0] + t[1],
+        "chain": lambda t: (t[0] @ t[1]) @ t[2],
+    }
+    if a.ref in refs:
+        ins = [torch_in[n] for n in order if n not in outputs]
+        ref = refs[a.ref](ins)
         pcc = torch.corrcoef(torch.stack([got[0].flatten(), ref.flatten()]))[0, 1].item()
         print(f"PCC     : {pcc:.6f}")
+        if a.block_pcc and got[0].dim() == 2:
+            n = a.block_pcc
+            g2, r2 = got[0], ref
+            for bi in range(0, g2.shape[0], n):
+                row = []
+                for bj in range(0, g2.shape[1], n):
+                    gb = g2[bi:bi+n, bj:bj+n].flatten(); rb = r2[bi:bi+n, bj:bj+n].flatten()
+                    row.append(torch.corrcoef(torch.stack([gb, rb]))[0, 1].item())
+                print("block-pcc row", bi // n, " ".join(f"{v:6.3f}" for v in row))
         print("PASS" if pcc > 0.99 else "FAIL")
     else:
         o = got[0]

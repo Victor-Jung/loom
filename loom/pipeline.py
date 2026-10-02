@@ -81,6 +81,33 @@ def run_step_0_frontend(
     return mlir_text
 
 
+def run_step_0b_tune(
+    mlir_text: str,
+    policy: str,
+    options: str,
+    ir_dir: Path,
+    debug: bool,
+) -> str:
+    """Step 0b: tune the mapping program (stage 00 → stage 00) via pybind11."""
+    logging.info("")
+    logging.info("=" * 72)
+    logging.info("STEP 0b: MAPPING-PROGRAM TUNING")
+    logging.info("=" * 72)
+    logging.info(f"  Policy : {policy}")
+    if options:
+        logging.info(f"  Options: {options}")
+
+    from loom_pipeline import run_mapping_tune  # noqa: PLC0415
+
+    with pipeline_timer("Step 0b: Mapping-Program Tuning"):
+        tuned = run_mapping_tune(mlir_text, policy, options)
+    if debug:
+        p00_tuned = ir_dir / "p00_tuned.mlir"
+        p00_tuned.write_text(tuned)
+        logging.info(f"  Output : {p00_tuned}")
+    return tuned
+
+
 def run_step_1_exploration(
     mlir_text: str,
     hw_spec: str,
@@ -244,6 +271,8 @@ def run_pipeline(
     assigned_block_size: dict[str, Any] | None = None,
     topk_candidates: int | None = None,
     topk_block_size: int = 1,
+    tune: str | None = None,
+    tune_options: str = "",
 ) -> None:
     """Run the full Loom compilation pipeline.
 
@@ -275,6 +304,12 @@ def run_pipeline(
     topk_block_size:
         Optional positive odd integer controlling 32-step neighbor sampling
         around each solver-selected block-size assignment.
+    tune:
+        Optional search policy name for tuning the stage-00 mapping program
+        (loop order, statement placement) before exploration. ``None`` leaves
+        the frontend output untouched.
+    tune_options:
+        Policy options; for the ``fixed`` policy the schedule string.
     """
     output_path = Path(output_path)
     ir_dir = output_path / "IRs"
@@ -284,6 +319,10 @@ def run_pipeline(
 
     # Step 0: Helion frontend
     mlir_text = run_step_0_frontend(generate_mlir_fn, ir_dir, debug)
+
+    # Step 0b (optional): mapping-program tuning
+    if tune is not None:
+        mlir_text = run_step_0b_tune(mlir_text, tune, tune_options, ir_dir, debug)
 
     has_assigned_block_size = bool(assigned_block_size)
     needs_manual_etg = (
