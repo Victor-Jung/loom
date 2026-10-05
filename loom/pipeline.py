@@ -85,6 +85,7 @@ def run_step_0b_tune(
     mlir_text: str,
     policy: str,
     options: str,
+    hoist: bool,
     ir_dir: Path,
     debug: bool,
 ) -> str:
@@ -96,11 +97,13 @@ def run_step_0b_tune(
     logging.info(f"  Policy : {policy}")
     if options:
         logging.info(f"  Options: {options}")
+    if hoist:
+        logging.info("  Hoist  : loop-invariant loads")
 
     from loom_pipeline import run_mapping_tune  # noqa: PLC0415
 
     with pipeline_timer("Step 0b: Mapping-Program Tuning"):
-        tuned = run_mapping_tune(mlir_text, policy, options)
+        tuned = run_mapping_tune(mlir_text, policy, options, hoist)
     if debug:
         p00_tuned = ir_dir / "p00_tuned.mlir"
         p00_tuned.write_text(tuned)
@@ -273,6 +276,7 @@ def run_pipeline(
     topk_block_size: int = 1,
     tune: str | None = None,
     tune_options: str = "",
+    tune_hoist: bool = False,
 ) -> None:
     """Run the full Loom compilation pipeline.
 
@@ -310,6 +314,8 @@ def run_pipeline(
         the frontend output untouched.
     tune_options:
         Policy options; for the ``fixed`` policy the schedule string.
+    tune_hoist:
+        Hoist loop-invariant loads out of temporal loops in every candidate.
     """
     output_path = Path(output_path)
     ir_dir = output_path / "IRs"
@@ -322,7 +328,7 @@ def run_pipeline(
 
     # Step 0b (optional): mapping-program tuning
     if tune is not None:
-        mlir_text = run_step_0b_tune(mlir_text, tune, tune_options, ir_dir, debug)
+        mlir_text = run_step_0b_tune(mlir_text, tune, tune_options, tune_hoist, ir_dir, debug)
 
     has_assigned_block_size = bool(assigned_block_size)
     needs_manual_etg = (

@@ -239,6 +239,13 @@ class LoomKernel:
             default=None,
             help="Options for --tune; for 'fixed' the schedule, e.g. 'interchange(m,n)'.",
         )
+        parser.add_argument(
+            "--tune-hoist",
+            dest="tune_hoist",
+            action="store_true",
+            default=False,
+            help="Hoist loop-invariant loads out of temporal loops in every tuned candidate.",
+        )
         return parser
 
     @classmethod
@@ -271,6 +278,7 @@ class LoomKernel:
         block_sizes = config_data.get("block_sizes")
         tune = args.tune or config_data.get("tune")
         tune_options = args.tune_options or config_data.get("tune_options") or ""
+        tune_hoist = bool(args.tune_hoist or config_data.get("tune_hoist", False))
         assigned_block_size = config_data.get("assigned_block_size")
 
         # Required parameter check
@@ -316,6 +324,7 @@ class LoomKernel:
             topk_block_size=args.topk_block_size,
             tune=tune,
             tune_options=tune_options,
+            tune_hoist=tune_hoist,
         )
 
 
