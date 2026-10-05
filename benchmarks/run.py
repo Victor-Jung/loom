@@ -36,7 +36,7 @@ CONTAINER = ["podman", "run", "--rm",
              "--security-opt", "label=disable", "--security-opt=seccomp=unconfined",
              "--init", "-w", "/workspace/loom", "ftod/loom_dev:latest", "bash", "-lc"]
 
-from benchmarks.programs import PROGRAMS  # noqa: E402
+from benchmarks.programs import PROGRAMS, Program  # noqa: E402
 
 
 def container(cmd: str, timeout: int = 1800) -> subprocess.CompletedProcess:
@@ -44,8 +44,9 @@ def container(cmd: str, timeout: int = 1800) -> subprocess.CompletedProcess:
 
 
 def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
-                    topk: int, njobs: int, hoist: bool = False) -> tuple[Path, str]:
-    prog = PROGRAMS[name]
+                    topk: int, njobs: int, hoist: bool = False,
+                    prog: Program | None = None) -> tuple[Path, str]:
+    prog = prog or PROGRAMS[name]
     out = Path("test/bench") / name / tag
     shape = f"-{prog.shape} " if prog.shape else ""
     tune_args = f"--tune {tune} " if tune else ""
@@ -61,6 +62,14 @@ def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
     (ROOT / out).mkdir(parents=True, exist_ok=True)
     (ROOT / out / "compile.log").write_text(log)
     return out, log
+
+
+def parse_stage_times(log: str) -> dict[str, float]:
+    """Pipeline step -> milliseconds, from the compile log's timing summary."""
+    times = {}
+    for m in re.finditer(r"^\s+(Step \d+[a-z]?: [^\n]+?)\s+([\d.]+)\s+[\d.]+%$", log, re.M):
+        times[m.group(1).strip()] = float(m.group(2))
+    return times
 
 
 def parse_solver(out: Path) -> dict[str, int]:
@@ -152,21 +161,36 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--tag", default=None, help="output sub-directory (default: policy name)")
+    ap.add_argument("--shape", default=None, help="kernel-size override, e.g. K64_M256_N256")
     ap.add_argument("--no-device", action="store_true",
                     help="compile and lower only; report the stage each candidate reaches")
+    ap.add_argument("--reuse", action="store_true",
+                    help="skip compilation and lowering when their outputs already exist")
     a = ap.parse_args()
 
     prog = PROGRAMS[a.program]
-    tag = a.tag or ((a.tune or "untuned") + ("_hoist" if a.tune_hoist else ""))
+    if a.shape:
+        prog = Program(prog.kernel, prog.config, prog.reference, a.shape, prog.min_pcc)
+    tag = a.tag or ((a.tune or "untuned") + ("_hoist" if a.tune_hoist else "") + (f"_{a.shape}" if a.shape else ""))
     rows: list[dict] = []
 
     print(f"== {a.program}  policy={a.tune or 'none'} {a.tune_options}")
-    out, log = compile_program(a.program, tag, a.tune, a.tune_options, a.topk, a.njobs, a.tune_hoist)
+    t0 = time.perf_counter()
+    out = Path("test/bench") / a.program / tag
+    if a.reuse and (ROOT / out / "IRs" / "p03_bufferized.mlir").exists():
+        log = (ROOT / out / "compile.log").read_text()
+    else:
+        out, log = compile_program(a.program, tag, a.tune, a.tune_options, a.topk, a.njobs, a.tune_hoist, prog)
+    compile_s = time.perf_counter() - t0
+    stage_ms = parse_stage_times(log)
+    summary = {"compile_wall_s": round(compile_s, 1), "stage_ms": stage_ms}
+    print("compile: " + f"{compile_s:.0f} s wall; " +
+          ", ".join(f"{k.split(':', 1)[0]}={v / 1000:.1f}s" for k, v in stage_ms.items()))
     if not (ROOT / out / "IRs" / "p03_bufferized.mlir").exists():
         err = next((l for l in log.splitlines() if "rror" in l or "assert" in l), log[-300:])
         print(f"compile FAILED: {err.strip()[:200]}")
         rows.append({"stage": "compile", "error": err.strip()[:500]})
-        (ROOT / out / "results.json").write_text(json.dumps(rows, indent=2))
+        (ROOT / out / "results.json").write_text(json.dumps({"summary": summary, "candidates": rows}, indent=2))
         return
 
     ranks = parse_solver(out)
@@ -176,7 +200,9 @@ def main() -> None:
         base = func.split("__is_double_buffer")[0]
         row = {"function": func, "T_total": ranks.get(base)}
         kdir = Path("tmp_output/bench") / a.program / tag / f"f{i}"
-        err = lower(out, i, kdir)
+        t1 = time.perf_counter()
+        err = "" if a.reuse and (ROOT / kdir / "compute.cpp").exists() else lower(out, i, kdir)
+        row["lower_s"] = round(time.perf_counter() - t1, 1)
         if err or not (ROOT / kdir / "compute.cpp").exists():
             msg = next((l for l in err.splitlines() if "error" in l), err[-300:])
             row.update(stage="lower", error=msg.strip()[:500])
@@ -197,10 +223,11 @@ def main() -> None:
             break  # a wedged board makes further runs meaningless
         ok = pcc >= prog.min_pcc
         row.update(stage="ok" if ok else "pcc", pcc=pcc, device_ms=ms)
-        print(f"[{i}] {base[:70]}\n     T_total={row['T_total']}  PCC={pcc:.6f} {'PASS' if ok else 'FAIL'}  device={ms:.3f} ms")
+        print(f"[{i}] {base[:70]}\n     T_total={row['T_total']}  PCC={pcc:.6f} {'PASS' if ok else 'FAIL'}  "
+              f"device={ms:.3f} ms  lower={row['lower_s']} s")
         rows.append(row)
 
-    (ROOT / out / "results.json").write_text(json.dumps(rows, indent=2))
+    (ROOT / out / "results.json").write_text(json.dumps({"summary": summary, "candidates": rows}, indent=2))
     print(f"results: {out}/results.json")
 
 

@@ -27,6 +27,10 @@ def _softmax(ins: list[torch.Tensor]) -> torch.Tensor:
     return torch.softmax(ins[0].float(), dim=-1)
 
 
+def _col_softmax(ins: list[torch.Tensor]) -> torch.Tensor:
+    return torch.softmax(ins[0].float(), dim=0)
+
+
 PROGRAMS: dict[str, Program] = {
     "toy_bmm": Program(
         kernel="kernels/toy_bmm.py",
@@ -58,5 +62,71 @@ PROGRAMS: dict[str, Program] = {
         kernel="kernels/row_softmax.py",
         config="kernels/config_files/row_softmax.json",
         reference=_softmax,
+    ),
+    "gemm_bias_exp": Program(
+        kernel="kernels/gemm_bias_exp.py",
+        config="kernels/config_files/gemm_bias_exp.json",
+        reference=lambda ins: torch.exp((ins[0] @ ins[1] + ins[2]) / 64.0),
+    ),
+    "softmax_twopass": Program(
+        kernel="kernels/softmax_twopass.py",
+        config="kernels/config_files/softmax_twopass.json",
+        reference=_softmax,
+    ),
+    "batch_sum": Program(
+        kernel="kernels/batch_sum.py",
+        config="kernels/config_files/batch_sum.json",
+        reference=lambda ins: ins[0].sum(dim=0),
+    ),
+    "transpose_matmul": Program(
+        kernel="kernels/transpose_matmul.py",
+        config="kernels/config_files/transpose_matmul.json",
+        reference=lambda ins: ins[0].T @ ins[1],
+    ),
+    "row_center": Program(
+        kernel="kernels/row_center.py",
+        config="kernels/config_files/row_center.json",
+        reference=lambda ins: ins[0] - ins[0].mean(dim=-1, keepdim=True),
+    ),
+    "attention_fullrow": Program(
+        kernel="kernels/attention_fullrow.py",
+        config="kernels/config_files/attention_fullrow.json",
+        reference=lambda ins: torch.softmax(ins[0] @ ins[1].T, dim=-1) @ ins[2],
+    ),
+    # Full-array variants: 12x10 mesh, sizes where traffic matters.
+    "toy_bmm_full": Program(
+        kernel="kernels/toy_bmm.py",
+        config="kernels/config_files/toy_bmm_full.json",
+        reference=lambda ins: ins[0] @ ins[1],
+        shape="B4_M2048_K1024_N2048",
+    ),
+    "shared_weight_bmm_full": Program(
+        kernel="kernels/shared_weight_bmm.py",
+        config="kernels/config_files/shared_weight_bmm_full.json",
+        reference=lambda ins: ins[0] @ ins[1],
+        shape="B8_M2048_K1024_N2048",
+    ),
+    "scaled_ewise_full": Program(
+        kernel="kernels/scaled_ewise.py",
+        config="kernels/config_files/scaled_ewise_full.json",
+        reference=lambda ins: ins[0] * ins[1],
+        shape="B16_M2048_N2048",
+    ),
+    "row_softmax_full": Program(
+        kernel="kernels/row_softmax.py",
+        config="kernels/config_files/row_softmax_full.json",
+        reference=_softmax,
+        shape="M8192_N1024",
+    ),
+    "chain_fused_full": Program(
+        kernel="kernels/chain_fused.py",
+        config="kernels/config_files/chain_fused_full.json",
+        reference=lambda ins: (ins[0] @ ins[1]) @ ins[2],
+        shape="M4096_K128_N4096_P128",
+    ),
+    "col_softmax": Program(
+        kernel="kernels/col_softmax.py",
+        config="kernels/config_files/col_softmax.json",
+        reference=_col_softmax,
     ),
 }

@@ -1,0 +1,18 @@
+{
+    "output_path": "test/gemm_bias_exp/x1y1",
+    "hw_spec": "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x1y1.mlir",
+    "block_sizes": {
+        "tile_m": {
+            "lb": 32,
+            "ub": 64
+        },
+        "tile_n": {
+            "lb": 32,
+            "ub": 64
+        },
+        "tile_k": {
+            "lb": 32,
+            "ub": 64
+        }
+    }
+}
