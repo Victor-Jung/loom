@@ -159,4 +159,16 @@ PROGRAMS: dict[str, Program] = {
         config="kernels/config_files/col_softmax.json",
         reference=_col_softmax,
     ),
+    "softmax_twopass_full": Program(
+        kernel="kernels/softmax_twopass.py",
+        config="kernels/config_files/softmax_twopass_full.json",
+        reference=_softmax,
+        shape="M8192_N1024",
+    ),
+    "attention_fullrow_full": Program(
+        kernel="kernels/attention_fullrow.py",
+        config="kernels/config_files/attention_fullrow_full.json",
+        reference=lambda ins: torch.softmax(ins[0] @ ins[1].T, dim=-1) @ ins[2],
+        shape="M4096_N256_D64",
+    ),
 }
