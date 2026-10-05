@@ -54,7 +54,7 @@ def print_breakdown(
 
     iter_num = variant["constraint_scope"]["metadata"]["iter_num"]
     seq_expr, seq_divisible = iter_num["seq_iter"]
-    seq_val = parse_expr(seq_expr).eval(assignments)
+    seq_val = parse_expr(seq_expr).eval(assignments) if seq_expr is not None else 1
     temp_pairs = iter_num["temp_iter"]
     temp_vals = [parse_expr(t[0]).eval(assignments) for t in temp_pairs]
     temp_product = 1

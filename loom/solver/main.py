@@ -82,9 +82,14 @@ def _collect_iter_num_constraints(
     iter_num: dict,
 ) -> tuple[list[dict], list[str], list[dict], list[str]]:
     """Collect solver feasibility expressions from constraint metadata."""
-    seq_iter, _ = _unpack_iter_num(iter_num["seq_iter"], "iter_num.seq_iter")
-    seq_exprs = [seq_iter]
-    seq_labels = ["iter_num.seq_iter"]
+    # A program without a sequential (reduction) loop has no seq_iter.
+    seq_exprs = []
+    seq_labels = []
+    raw_seq_iter = iter_num.get("seq_iter")
+    if raw_seq_iter is not None and raw_seq_iter[0] is not None:
+        seq_iter, _ = _unpack_iter_num(raw_seq_iter, "iter_num.seq_iter")
+        seq_exprs.append(seq_iter)
+        seq_labels.append("iter_num.seq_iter")
     temp_exprs = []
     temp_labels = []
 
