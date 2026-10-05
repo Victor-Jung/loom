@@ -53,3 +53,16 @@ def test_no_constraint_divides_an_extent_of_one(variants: list) -> None:
     for v in variants:
         for d in _divisible(v):
             assert d["x"]["Div"][0] != {"Const": 1}, (v.get("variant_name"), d)
+
+
+def test_spatially_split_tiles_must_divide_their_extent(variants: list) -> None:
+    # The solver rounds division up, so `(10 / tile_c) mod 10 == 0` alone
+    # accepts tiles that leave a partial last tile; every split symbol also
+    # carries `(extent / tile) * tile == extent`.
+    chunk_split = [v for v in variants
+                   if (v.get("variant_name") or v.get("name", "")).startswith(
+                       "_mamba_chunk_scan__x6_y1y1y10__d0i0_d1i0_d2i1_d3i2")][0]
+    exact = [c["Eq"] for c in chunk_split["constraint_scope"]["hard_constraints"] if "Eq" in c]
+    wanted = [{"Const": 10}, {"Sym": "tile_c"}]
+    assert any(e[0] == {"Mul": [{"Div": wanted}, {"Sym": "tile_c"}]} and e[1] == {"Const": 10}
+               for e in exact), exact
