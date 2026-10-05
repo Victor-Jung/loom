@@ -118,6 +118,36 @@ PROGRAMS: dict[str, Program] = {
         reference=_softmax,
         shape="M8192_N1024",
     ),
+    "gemm_bias_exp_full": Program(
+        kernel="kernels/gemm_bias_exp.py",
+        config="kernels/config_files/gemm_bias_exp_full.json",
+        reference=lambda ins: torch.exp((ins[0] @ ins[1] + ins[2]) / 64.0),
+        shape="M4096_K1024_N4096",
+    ),
+    "batch_sum_full": Program(
+        kernel="kernels/batch_sum.py",
+        config="kernels/config_files/batch_sum_full.json",
+        reference=lambda ins: ins[0].sum(dim=0),
+        shape="B16_M2048_N2048",
+    ),
+    "col_softmax_full": Program(
+        kernel="kernels/col_softmax.py",
+        config="kernels/config_files/col_softmax_full.json",
+        reference=_col_softmax,
+        shape="M1024_N8192",
+    ),
+    "row_center_full": Program(
+        kernel="kernels/row_center.py",
+        config="kernels/config_files/row_center_full.json",
+        reference=lambda ins: ins[0] - ins[0].mean(dim=-1, keepdim=True),
+        shape="M8192_N1024",
+    ),
+    "transpose_matmul_full": Program(
+        kernel="kernels/transpose_matmul.py",
+        config="kernels/config_files/transpose_matmul_full.json",
+        reference=lambda ins: ins[0].T @ ins[1],
+        shape="K1024_M4096_N4096",
+    ),
     "chain_fused_full": Program(
         kernel="kernels/chain_fused.py",
         config="kernels/config_files/chain_fused_full.json",
