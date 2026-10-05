@@ -159,6 +159,39 @@ PROGRAMS: dict[str, Program] = {
         config="kernels/config_files/col_softmax.json",
         reference=_col_softmax,
     ),
+    "bias_add": Program(
+        kernel="kernels/bias_add.py",
+        config="kernels/config_files/bias_add.json",
+        reference=lambda ins: ins[0] + ins[1],
+    ),
+    "outer_scale": Program(
+        kernel="kernels/outer_scale.py",
+        config="kernels/config_files/outer_scale.json",
+        reference=lambda ins: ins[0] * ins[1] * ins[2],
+    ),
+    "weighted_batch_sum": Program(
+        kernel="kernels/weighted_batch_sum.py",
+        config="kernels/config_files/weighted_batch_sum.json",
+        reference=lambda ins: (ins[0] * ins[1]).sum(dim=0),
+    ),
+    "bias_add_full": Program(
+        kernel="kernels/bias_add.py",
+        config="kernels/config_files/bias_add_full.json",
+        reference=lambda ins: ins[0] + ins[1],
+        shape="B16_M2048_N2048",
+    ),
+    "outer_scale_full": Program(
+        kernel="kernels/outer_scale.py",
+        config="kernels/config_files/outer_scale_full.json",
+        reference=lambda ins: ins[0] * ins[1] * ins[2],
+        shape="M4096_N4096",
+    ),
+    "weighted_batch_sum_full": Program(
+        kernel="kernels/weighted_batch_sum.py",
+        config="kernels/config_files/weighted_batch_sum_full.json",
+        reference=lambda ins: (ins[0] * ins[1]).sum(dim=0),
+        shape="B16_M2048_N2048",
+    ),
     "softmax_twopass_full": Program(
         kernel="kernels/softmax_twopass.py",
         config="kernels/config_files/softmax_twopass_full.json",

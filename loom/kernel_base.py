@@ -219,6 +219,14 @@ class LoomKernel:
             help="Keep only the top K candidates by optimal time in the final output.",
         )
         parser.add_argument(
+            "--topk-per-order",
+            dest="topk_per_order",
+            type=_positive_int,
+            default=None,
+            metavar="K",
+            help="Keep at most K mapping variants per tuner loop order before the top-K cut.",
+        )
+        parser.add_argument(
             "--topk-block-size",
             type=_positive_odd_int,
             default=1,
@@ -321,6 +329,7 @@ class LoomKernel:
             symbol_domains=symbol_domains,
             assigned_block_size=assigned_block_size if has_assigned_block_size else None,
             topk_candidates=args.topk_candidates,
+            topk_per_order=args.topk_per_order,
             topk_block_size=args.topk_block_size,
             tune=tune,
             tune_options=tune_options,

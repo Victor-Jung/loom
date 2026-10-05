@@ -45,7 +45,7 @@ def container(cmd: str, timeout: int = 1800) -> subprocess.CompletedProcess:
 
 def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
                     topk: int, njobs: int, hoist: bool = False,
-                    prog: Program | None = None) -> tuple[Path, str]:
+                    prog: Program | None = None, per_order: int | None = None) -> tuple[Path, str]:
     prog = prog or PROGRAMS[name]
     out = Path("test/bench") / name / tag
     shape = f"-{prog.shape} " if prog.shape else ""
@@ -54,6 +54,8 @@ def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
         tune_args += f"--tune-options '{tune_options}' "
     if tune and hoist:
         tune_args += "--tune-hoist "
+    if per_order:
+        tune_args += f"--topk-per-order {per_order} "
     cmd = (f"rm -rf {out} && env -u VIRTUAL_ENV uv run python -u {prog.kernel} {shape}"
            f"--config {prog.config} --output-path {out} --debug --njobs {njobs} "
            f"--topk-candidates {topk} {tune_args}")
@@ -84,6 +86,15 @@ def parse_solver(out: Path) -> dict[str, int]:
 def p03_functions(out: Path) -> list[str]:
     text = (ROOT / out / "IRs" / "p03_bufferized.mlir").read_text()
     return re.findall(r"func\.func @(\S+?)\(", text)
+
+
+def tune_estimates(out: Path) -> dict[str, int]:
+    """Function name -> the tuner's traffic estimate (elements), when tuned."""
+    text = (ROOT / out / "IRs" / "p03_bufferized.mlir").read_text()
+    est = {}
+    for m in re.finditer(r"func\.func @(\S+?)\(.*?\{(?:[^{}]*?)loom\.tune\.estimate = (\d+)", text, re.S):
+        est[m.group(1)] = int(m.group(2))
+    return est
 
 
 def lower(out: Path, index: int, kdir: Path) -> str:
@@ -157,6 +168,8 @@ def main() -> None:
     ap.add_argument("--tune-options", default="")
     ap.add_argument("--tune-hoist", action="store_true", help="hoist loop-invariant loads in every candidate")
     ap.add_argument("--topk", type=int, default=1)
+    ap.add_argument("--per-order", type=int, default=None,
+                    help="keep at most K mapping variants per tuner loop order before the top-k cut")
     ap.add_argument("--njobs", type=int, default=4)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
@@ -180,7 +193,8 @@ def main() -> None:
     if a.reuse and (ROOT / out / "IRs" / "p03_bufferized.mlir").exists():
         log = (ROOT / out / "compile.log").read_text()
     else:
-        out, log = compile_program(a.program, tag, a.tune, a.tune_options, a.topk, a.njobs, a.tune_hoist, prog)
+        out, log = compile_program(a.program, tag, a.tune, a.tune_options, a.topk, a.njobs, a.tune_hoist, prog,
+                                   a.per_order)
     compile_s = time.perf_counter() - t0
     stage_ms = parse_stage_times(log)
     summary = {"compile_wall_s": round(compile_s, 1), "stage_ms": stage_ms}
@@ -194,11 +208,12 @@ def main() -> None:
         return
 
     ranks = parse_solver(out)
+    estimates = tune_estimates(out)
     funcs = p03_functions(out)
     print(f"compiled: {len(funcs)} candidate(s)")
     for i, func in enumerate(funcs, start=1):
         base = func.split("__is_double_buffer")[0]
-        row = {"function": func, "T_total": ranks.get(base)}
+        row = {"function": func, "T_total": ranks.get(base), "estimate": estimates.get(func)}
         kdir = Path("tmp_output/bench") / a.program / tag / f"f{i}"
         t1 = time.perf_counter()
         err = "" if a.reuse and (ROOT / kdir / "compute.cpp").exists() else lower(out, i, kdir)
@@ -223,7 +238,8 @@ def main() -> None:
             break  # a wedged board makes further runs meaningless
         ok = pcc >= prog.min_pcc
         row.update(stage="ok" if ok else "pcc", pcc=pcc, device_ms=ms)
-        print(f"[{i}] {base[:70]}\n     T_total={row['T_total']}  PCC={pcc:.6f} {'PASS' if ok else 'FAIL'}  "
+        est = f"  estimate={row['estimate']}" if row["estimate"] is not None else ""
+        print(f"[{i}] {base[:70]}\n     T_total={row['T_total']}{est}  PCC={pcc:.6f} {'PASS' if ok else 'FAIL'}  "
               f"device={ms:.3f} ms  lower={row['lower_s']} s")
         rows.append(row)
 

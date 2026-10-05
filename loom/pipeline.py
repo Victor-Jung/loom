@@ -192,6 +192,7 @@ def run_step_3_solve(
     symbol_domains: dict[str, list[int]] | None = None,
     topk_candidates: int | None = None,
     topk_block_size: int = 1,
+    topk_per_order: int | None = None,
 ) -> dict[str, Any]:
     """Step 3: CPMpy/CP-SAT solver (finds optimal block sizes)."""
     if topk_candidates is not None and topk_candidates <= 0:
@@ -218,6 +219,7 @@ def run_step_3_solve(
             topk_candidates=topk_candidates,
             topk_block_size=topk_block_size,
             debug=debug,
+            topk_per_order=topk_per_order,
         )
 
     feasible_count = sum(1 for v in block_sizes.values() if v is not None)
@@ -272,6 +274,7 @@ def run_pipeline(
     debug: bool = False,
     symbol_domains: dict[str, list[int]] | None = None,
     assigned_block_size: dict[str, Any] | None = None,
+    topk_per_order: int | None = None,
     topk_candidates: int | None = None,
     topk_block_size: int = 1,
     tune: str | None = None,
@@ -388,6 +391,7 @@ def run_pipeline(
         block_size = run_step_3_solve(
             resolved_etg_path, njobs, debug, constraints_dir,
             symbol_domains=symbol_domains,
+            topk_per_order=topk_per_order,
             topk_candidates=topk_candidates,
             topk_block_size=topk_block_size,
         )

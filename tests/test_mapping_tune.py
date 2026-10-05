@@ -70,10 +70,15 @@ def test_interchange_swaps_loops_and_hoists_bounds() -> None:
 
 
 def test_enumerate_emits_one_function_per_loop_order() -> None:
+    # Interchange gives the two temporal orders; spatialize/temporalize add
+    # every choice of spatial axes (sorted, so axis order never duplicates).
     result = tune(EWISE, "policy=enumerate")
     assert result.returncode == 0, result.stderr[-2000:]
-    names = sorted(re.findall(r"func\.func @(\S+?)\(", result.stdout))
-    assert names == ["_ewise3d__order_b_m_n", "_ewise3d__order_b_n_m"], names
+    names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
+    assert len(names) == len(set(names)), names
+    assert {"_ewise3d__order_b_m_n", "_ewise3d__order_b_n_m",
+            "_ewise3d__order_bSm_n", "_ewise3d__order_bSmSn"} <= set(names), names
+    assert not any("mSb" in n or "nSm" in n or "nSb" in n for n in names), names
 
 
 def test_greedy_moves_the_shared_operand_loop_innermost() -> None:
@@ -107,10 +112,73 @@ def test_hoist_leaves_reduction_loads_alone() -> None:
     assert plain.stdout == hoisted.stdout
 
 
-def test_random_keeps_the_start_when_nothing_is_legal() -> None:
+def test_random_returns_distinct_legal_trees() -> None:
+    # The matmul's temporal k loop carries the accumulator and cannot move;
+    # only its spatial axes can be temporalized, so every tree random reaches
+    # keeps k innermost and all candidates are distinct.
     result = tune(MATMUL, "policy=random", "options=seed=3;walks=4;len=2")
     assert result.returncode == 0, result.stderr[-2000:]
-    assert re.findall(r"func\.func @(\S+?)\(", result.stdout) == ["_matmul"]
+    names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
+    assert names and len(names) == len(set(names)), names
+    for name in names:
+        assert name == "_matmul" or (name.startswith("_matmul__order_")
+                                     and name.endswith("_k")), name
+
+
+def test_spatialize_adds_an_axis_and_hoists_its_bound() -> None:
+    result = tune(SCALED, "policy=fixed", "options=spatialize(b)")
+    assert result.returncode == 0, result.stderr[-2000:]
+    out = result.stdout
+    par = re.search(r"affine\.parallel \((%\w+), (%\w+)\) = \(0, 0\) to "
+                    r"\(symbol\((%\w+)\), symbol\((%\w+)\)\)", out)
+    assert par, out
+    # Both bounds are defined before the parallel loop.
+    for bound in (par.group(3), par.group(4)):
+        assert out.index(f"{bound} = arith.ceildivui") < par.start(), bound
+    assert out.count("scf.for") == 1
+
+
+def test_spatialize_refuses_a_reduction_loop() -> None:
+    result = tune(MATMUL, "policy=fixed", "options=spatialize(k)")
+    assert result.returncode != 0
+    assert "iter_args" in result.stderr
+
+
+def test_temporalize_keeps_the_last_spatial_axis() -> None:
+    result = tune(SCALED, "policy=fixed", "options=temporalize(m)")
+    assert result.returncode != 0
+    assert "last spatial axis" in result.stderr
+
+
+def test_temporalize_then_spatialize_round_trips() -> None:
+    plain = run(str(MATMUL))
+    result = tune(MATMUL, "policy=fixed", "options=temporalize(n);spatialize(n)")
+    assert result.returncode == 0, result.stderr[-2000:]
+    # Same loop structure: a two-axis parallel over m and n around the k loop.
+    assert result.stdout.count("affine.parallel (") == 1
+    assert "scf.for" in result.stdout
+    assert plain.stdout.count("scf.for") == result.stdout.count("scf.for")
+
+
+def test_beam_ranks_the_multicast_and_interchange_trees_first() -> None:
+    # s[m, n] is invariant in b. Both making b spatial (multicast) and moving
+    # it innermost (reuse) cut its traffic to one fetch; the untuned order
+    # refetches it per b.
+    result = tune(SCALED, "policy=beam", "options=width=4;depth=4;keep=3", "dump-tree")
+    assert result.returncode == 0, result.stderr[-2000:]
+    names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
+    assert len(names) == 3, names
+    assert "_scaled_ewise__order_m_b_n" not in names, names
+    assert {"_scaled_ewise__order_m_n_b", "_scaled_ewise__order_bSm_n"} <= set(names), names
+    estimates = [float(e) for e in re.findall(r"estimate ([0-9.e+]+)\)", result.stderr)]
+    assert estimates[0] > min(estimates[1:]), estimates
+
+
+def test_beam_width_one_depth_zero_is_identity() -> None:
+    plain = run(str(SCALED))
+    result = tune(SCALED, "policy=beam", "options=width=1;depth=0;keep=1")
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert plain.stdout == result.stdout
 
 
 def test_illegal_interchange_is_rejected() -> None:

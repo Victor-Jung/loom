@@ -1,5 +1,6 @@
 """CPMpy-based block-size optimizer for Loom using Pure Python AST."""
 
+import re
 import argparse
 import sys
 from itertools import product
@@ -351,6 +352,22 @@ def _write_detailed_log(
                 print("-" * 72, file=log)
 
 
+def _order_of(variant_name: str) -> str:
+    m = re.search(r"__order_(.+?)__x\d", variant_name)
+    return m.group(1) if m else ""
+
+
+def _best_per_order(ranked: list[dict], k: int) -> list[dict]:
+    kept: dict[str, int] = {}
+    out = []
+    for r in ranked:
+        order = _order_of(get_variant_name(r["variant"], r["index"]))
+        if kept.get(order, 0) < k:
+            kept[order] = kept.get(order, 0) + 1
+            out.append(r)
+    return out
+
+
 def run(
     input_path: Path | str,
     njobs: int = 1,
@@ -360,11 +377,14 @@ def run(
     topk_block_size: int = 1,
     debug: bool = False,
     topk: int | None = None,
+    topk_per_order: int | None = None,
 ) -> dict[str, dict[str, int] | None]:
     if topk is not None:
         topk_candidates = topk
     if topk_candidates is not None and topk_candidates <= 0:
         raise ValueError("topk_candidates must be a positive integer")
+    if topk_per_order is not None and topk_per_order <= 0:
+        raise ValueError("topk_per_order must be a positive integer")
     if topk_block_size <= 0:
         raise ValueError("topk_block_size must be a positive integer")
 
@@ -402,6 +422,12 @@ def run(
 
     # Rank solved candidates globally, then take the requested prefix directly.
     ranked_results = _rank_optimal_results(results)
+    if topk_per_order is not None:
+        # Keep the best K mapping variants of every tuner loop order (the
+        # `__order_<sig>__` token the tuning pass puts in the function name),
+        # so candidates differing only in their spatial mapping do not crowd
+        # out another loop order.
+        ranked_results = _best_per_order(ranked_results, topk_per_order)
     selected_results = (
         ranked_results[:topk_candidates]
         if topk_candidates is not None
