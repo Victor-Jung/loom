@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+import math
+
 import torch
 
 Reference = Callable[[list[torch.Tensor]], torch.Tensor]
@@ -29,6 +31,63 @@ def _softmax(ins: list[torch.Tensor]) -> torch.Tensor:
 
 def _col_softmax(ins: list[torch.Tensor]) -> torch.Tensor:
     return torch.softmax(ins[0].float(), dim=0)
+
+
+def _gqa_decode(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins in p03 order: K transposed [BG, D, S], V [BG, S, D], q [BG, 32, D]."""
+    kt, v, q = ins
+    s = torch.softmax((q.float() @ kt.float()) / math.sqrt(q.shape[-1]), dim=-1)
+    return s @ v.float()
+
+
+def _mask_softmax(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins: scores [B, H, S, N], mask [S, N] shared by batch and heads; the scale is 1/sqrt(N)."""
+    x, mask = ins
+    return torch.softmax(x.float() / math.sqrt(x.shape[-1]) + mask.float(), dim=-1)
+
+
+def _rmsnorm_residual(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins: two [M, N] operands (x and res, order irrelevant) and the weight [1, N]."""
+    w = next(t for t in ins if t.shape[0] == 1)
+    x, res = [t for t in ins if t.shape[0] != 1]
+    h = x.float() + res.float()
+    return h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-5) * w.float()
+
+
+def _mla_decode(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins (identified by shape): q [B, H, D], the latent kv [B, S, D] (used for PV) and
+    its transposed view [B, D, S] (used for QK^T); the frontend makes both views arguments."""
+    q = min(ins, key=lambda t: t.shape[1] * t.shape[2])
+    kvt = next(t for t in ins if t is not q and t.shape[1] == q.shape[-1])
+    kv = next(t for t in ins if t is not q and t is not kvt)
+    s = torch.softmax((q.float() @ kvt.float()) / math.sqrt(q.shape[-1]), dim=-1)
+    return s @ kv.float()
+
+
+def _gqa_prefill(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins (identified by shape): q [BH, S, D], K transposed [BG, D, S], V [BG, S, D]; RATIO = BH / BG."""
+    q = max(ins, key=lambda t: t.shape[0])
+    kt = next(t for t in ins if t is not q and t.shape[1] < t.shape[2])
+    v = next(t for t in ins if t is not q and t is not kt)
+    ratio = q.shape[0] // v.shape[0]
+    g = torch.arange(q.shape[0]) // ratio
+    s = torch.softmax((q.float() @ kt.float()[g]) / math.sqrt(q.shape[-1]), dim=-1)
+    return s @ v.float()[g]
+
+
+def _rotary(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins (identified by shape): x [H, T, D], cos and sin [T, D] (sum order free), rot [D, D]."""
+    x = next(t for t in ins if t.dim() == 3)
+    rot = next(t for t in ins if t.dim() == 2 and t.shape[0] == t.shape[1] and t.shape[0] == x.shape[-1])
+    cos, sin = [t for t in ins if t is not x and t is not rot]
+    return x.float() * cos.float() + (x.float() @ rot.float()) * sin.float()
+
+
+def _flash_attention(ins: list[torch.Tensor]) -> torch.Tensor:
+    """ins in p03 order: K transposed [BH, d, L], V [BH, L, d], q [BH, L, d]."""
+    kt, v, q = ins
+    s = torch.softmax((q.float() @ kt.float()) / math.sqrt(q.shape[-1]), dim=-1)
+    return s @ v.float()
 
 
 PROGRAMS: dict[str, Program] = {
@@ -203,5 +262,45 @@ PROGRAMS: dict[str, Program] = {
         config="kernels/config_files/attention_fullrow_full.json",
         reference=lambda ins: torch.softmax(ins[0] @ ins[1].T, dim=-1) @ ins[2],
         shape="M4096_N256_D64",
+    ),
+    "gqa_decode": Program(
+        kernel="kernels/gqa_decode.py",
+        config="kernels/config_files/gqa_decode.json",
+        reference=_gqa_decode,
+    ),
+    "mask_softmax": Program(
+        kernel="kernels/mask_softmax.py",
+        config="kernels/config_files/mask_softmax.json",
+        reference=_mask_softmax,
+    ),
+    "rmsnorm_residual": Program(
+        kernel="kernels/rmsnorm_residual.py",
+        config="kernels/config_files/rmsnorm_residual.json",
+        reference=_rmsnorm_residual,
+    ),
+    "mla_decode": Program(
+        # The GQA decode kernel with all 128 heads as query rows over the 576-wide
+        # latent; the host passes the latent cache as both K and V (two reads). D is
+        # 512 (no rope columns): the frontend rounds a 576-wide specialized dim to 1024.
+        kernel="kernels/gqa_decode.py",
+        config="kernels/config_files/mla_decode.json",
+        reference=_gqa_decode,
+        shape="B8_G1_S4096_D512_ROWS128",
+    ),
+    "gqa_prefill": Program(
+        kernel="kernels/gqa_prefill.py",
+        config="kernels/config_files/gqa_prefill.json",
+        reference=_gqa_prefill,
+    ),
+    "rotary": Program(
+        kernel="kernels/rotary.py",
+        config="kernels/config_files/rotary.json",
+        reference=_rotary,
+    ),
+    "flash_attention": Program(
+        kernel="kernels/flash_attention.py",
+        config="kernels/config_files/flash_attention_bench.json",
+        reference=_flash_attention,
+        shape="B1_L960_H128",
     ),
 }

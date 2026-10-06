@@ -74,3 +74,23 @@ def test_broadcast_result_survives_to_its_consumer(split_output: str) -> None:
     first_dest = generics[0][1].split(":")[0].strip()
     assert first_dest != bcast_dest, f"the intermediate is parked in the broadcast's buffer {first_dest}"
     assert first_dest in generics[1][0], "second op does not read the intermediate"
+
+
+def test_accumulating_chain_stays_in_place() -> None:
+    """acc = acc * alpha + pv with outs = acc: the first op reads the
+    destination's own storage, so the intermediate stays in acc (same SSA
+    value for ins and outs of both halves) and no scratch is allocated."""
+    if not TT_OPT.exists():
+        pytest.skip(f"tt-opt not built at {TT_OPT}; set LOOM_TT_OPT to override")
+    fixture = ROOT / "tests" / "fixtures" / "split_chain_accumulate.mlir"
+    res = subprocess.run([str(TT_OPT), f"--input={fixture}"], capture_output=True, text=True, timeout=300, cwd=ROOT)
+    assert res.returncode == 0, res.stderr
+    out = res.stdout
+    assert out.count("loom.alloc") == 3, out
+    generics = _generics(out)
+    assert len(generics) == 2, out
+    acc = generics[0][1].split(":")[0].strip()
+    assert generics[0][0].split(",")[0].strip() == acc, "first half is not in place on acc"
+    assert generics[1][1].split(":")[0].strip() == acc, "second half does not write acc"
+    assert generics[1][0].split(",")[0].strip() == acc, "second half does not read the in-place intermediate"
+

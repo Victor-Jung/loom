@@ -1,12 +1,15 @@
-"""Flash Attention kernel for the Loom pipeline.
+"""Grouped-query attention decode: one query token per sequence against a
+long KV cache, the heads of one kv group padded to a 32-row query block.
 
-Standalone CLI script. Run from the repo root:
+    q[b, g]: [32, D]  (rows 0..ratio-1 hold the group's query heads)
+    K[b, g]: [S, D]   V[b, g]: [S, D]
+    out[b, g] = softmax(q K^T / sqrt(D)) V
 
-    uv run python kernels/flash_attention.py --config kernels/config_files/flash_attention.json --njobs 8 --debug --topk-candidates 1 --topk-block-size 1
+Benchmark program against `ttnn.transformer.scaled_dot_product_attention_decode`,
+which pads the group's heads to a tile the same way. The (batch, group) pairs
+are the parallel loop; the KV cache is walked once with an online softmax.
 
-This script inherits the full Loom CLI and pipeline from LoomKernel.
-To write your own kernel, copy this file, replace the kernel body
-and bind_args tensors, and keep the __main__ block unchanged.
+    python kernels/gqa_decode.py -B8_G8_S4096_D128 --config kernels/config_files/gqa_decode.json --debug
 """
 
 from __future__ import annotations
@@ -23,16 +26,10 @@ from loom.loom_utils.kernel_size import resolve_kernel_shape_args
 from helion_mlir.custom_op import broadcast, set_memory_space
 
 
-def _flash__attention(
-    q_in: torch.Tensor,
-    k_in: torch.Tensor,
-    v_in: torch.Tensor,
-) -> torch.Tensor:
+def _gqa_decode(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> torch.Tensor:
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
-    assert n_dim == v_in.size(-2)
     head_dim = hl.specialize(q_in.size(-1))
-    assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
@@ -67,59 +64,41 @@ def _flash__attention(
     return out_.view(q_in.size())
 
 
-class FlashAttention(LoomKernel):
+class GQADecode(LoomKernel):
+    kernel_name = "gqa_decode"
 
-    kernel_name = "Flash Attention"
+    B: int = 8      # sequences
+    G: int = 8      # kv heads (query groups)
+    S: int = 4096   # cached positions
+    D: int = 128    # head dim
+    ROWS: int = 32  # query heads of a group, padded to one tile
+    assume_divisible: bool = True
+    tile_upper_bounds = {"tile_b": 1}  # one (batch, group) pair per block: the matmuls are 2-D
 
-    B: int = 2
-    L: int = 4096
-    H: int = 128
-    d: int = int(1024 * 64 / H)
-    _logical_B: int = B
-
-    assume_divisible = True
-    tile_upper_bounds = {"tile_b": 1}  # one head per block: the matmuls are 2-D
-
-    # Assign the helion-decorated function as a class attribute.
-    # We cannot stack @staticmethod with @helion.kernel because the helion
-    # decorator returns a custom object, not a plain callable.
     kernel = helion.kernel(
         static_shapes=False,
         autotune_config_overrides={
             "range_unroll_factors": [0, 0],
             "range_num_stages": [0, 0],
         },
-    )(_flash__attention)
+    )(_gqa_decode)
 
     def __init__(self, shape: dict[str, int] | None = None) -> None:
-        cls = type(self)
-        logical_b = cls._logical_B
         if shape:
+            cls = type(self)
             for key, value in shape.items():
-                if key == "B":
-                    logical_b = value
-                else:
-                    setattr(cls, key, value)
-
-        cls._logical_B = logical_b
-        cls.d = int(1024 * 64 / cls.H)
-        cls.B = logical_b * cls.H
+                setattr(cls, key, value)
 
     @classmethod
     def bind_args(cls) -> tuple:
-        """Return concrete input tensors that define B*H, L, d at MLIR-gen time."""
-        q = torch.empty([cls.B, cls.L, cls.d], dtype=torch.float16)
-        k = torch.empty([cls.B, cls.L, cls.d], dtype=torch.float16)
-        v = torch.empty([cls.B, cls.L, cls.d], dtype=torch.float16)
+        bg = cls.B * cls.G
+        q = torch.empty([bg, cls.ROWS, cls.D], dtype=torch.float16)
+        k = torch.empty([bg, cls.S, cls.D], dtype=torch.float16)
+        v = torch.empty([bg, cls.S, cls.D], dtype=torch.float16)
         return (q, k, v)
 
 
 if __name__ == "__main__":
-    try:
-        shape, normalized_argv = resolve_kernel_shape_args(sys.argv)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-
-    sys.argv = normalized_argv
-    kernel = FlashAttention(shape)
-    kernel.run()
+    shape, argv = resolve_kernel_shape_args(sys.argv)
+    sys.argv = argv
+    GQADecode(shape).run()
