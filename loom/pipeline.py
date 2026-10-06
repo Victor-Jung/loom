@@ -88,6 +88,7 @@ def run_step_0b_tune(
     hoist: bool,
     ir_dir: Path,
     debug: bool,
+    hw_spec: str | Path | None = None,
 ) -> str:
     """Step 0b: tune the mapping program (stage 00 → stage 00) via pybind11."""
     logging.info("")
@@ -103,7 +104,8 @@ def run_step_0b_tune(
     from loom_pipeline import run_mapping_tune  # noqa: PLC0415
 
     with pipeline_timer("Step 0b: Mapping-Program Tuning"):
-        tuned = run_mapping_tune(mlir_text, policy, options, hoist)
+        tuned = run_mapping_tune(mlir_text, policy, options, hoist,
+                                 str(hw_spec) if hw_spec else "")
     if debug:
         p00_tuned = ir_dir / "p00_tuned.mlir"
         p00_tuned.write_text(tuned)
@@ -331,7 +333,7 @@ def run_pipeline(
 
     # Step 0b (optional): mapping-program tuning
     if tune is not None:
-        mlir_text = run_step_0b_tune(mlir_text, tune, tune_options, tune_hoist, ir_dir, debug)
+        mlir_text = run_step_0b_tune(mlir_text, tune, tune_options, tune_hoist, ir_dir, debug, hw_spec)
 
     has_assigned_block_size = bool(assigned_block_size)
     needs_manual_etg = (
