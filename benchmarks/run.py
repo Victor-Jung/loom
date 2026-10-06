@@ -161,7 +161,44 @@ def run_on_device(kdir: Path, shapes: list[list[int]], reference, iters: int, wa
         ttnn.close_device(d)
 
 
+RESET_CMD = ["podman", "run", "--rm", "--device", "/dev/tenstorrent", "--privileged",
+             "ftod/loom_dev:latest", "bash", "-lc", "tt-smi -r"]
+
+
+def reset_board() -> None:
+    subprocess.run(RESET_CMD, capture_output=True, timeout=300)
+
+
+def run_candidate_in_process(program: str, kdir: Path, shapes: list[list[int]],
+                             iters: int, warmup: int, timeout_s: int) -> dict:
+    """Run one candidate in a child process so a hung kernel cannot take the
+    other candidates with it. On a timeout the child is killed and the board
+    reset before the next candidate."""
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", program,
+           str(kdir), json.dumps(shapes), str(iters), str(warmup)]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=ROOT)
+    except subprocess.TimeoutExpired:
+        reset_board()
+        return {"stage": "run", "error": f"hang: no result within {timeout_s} s; board reset"}
+    line = next((l for l in reversed(res.stdout.splitlines()) if l.startswith("RESULT ")), None)
+    if res.returncode != 0 or line is None:
+        reset_board()
+        tail = (res.stderr or res.stdout)[-500:]
+        return {"stage": "run", "error": f"worker failed (exit {res.returncode}): {tail.strip()}"}
+    return json.loads(line[len("RESULT "):])
+
+
+def worker(argv: list[str]) -> None:
+    program, kdir, shapes, iters, warmup = argv[0], Path(argv[1]), json.loads(argv[2]), int(argv[3]), int(argv[4])
+    pcc, ms = run_on_device(kdir, shapes, PROGRAMS[program].reference, iters, warmup)
+    print("RESULT " + json.dumps({"pcc": pcc, "device_ms": ms}), flush=True)
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        worker(sys.argv[2:])
+        return
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("program", choices=sorted(PROGRAMS))
     ap.add_argument("--tune", default=None, help="search policy (identity, fixed, enumerate, random)")
@@ -179,6 +216,10 @@ def main() -> None:
                     help="compile and lower only; report the stage each candidate reaches")
     ap.add_argument("--reuse", action="store_true",
                     help="skip compilation and lowering when their outputs already exist")
+    ap.add_argument("--timeout", type=int, default=180,
+                    help="seconds a candidate may take on the device before it counts as a hang")
+    ap.add_argument("--reset-each", action="store_true",
+                    help="reset the board before every candidate, not only after a failure")
     a = ap.parse_args()
 
     prog = PROGRAMS[a.program]
@@ -229,13 +270,15 @@ def main() -> None:
             print(f"[{i}] {base[:70]}  T_total={row['T_total']}  lowered -> {kdir}")
             rows.append(row)
             continue
-        try:
-            pcc, ms = run_on_device(kdir, arg_shapes(out, func), prog.reference, a.iters, a.warmup)
-        except Exception as e:  # noqa: BLE001 - report the stage, keep going
-            row.update(stage="run", error=str(e)[:500])
-            print(f"[{i}] {base[:60]}  run FAILED: {str(e)[:120]}")
+        if a.reset_each:
+            reset_board()
+        res = run_candidate_in_process(a.program, kdir, arg_shapes(out, func), a.iters, a.warmup, a.timeout)
+        if "error" in res:
+            row.update(res)
+            print(f"[{i}] {base[:60]}  run FAILED: {res['error'][:120]}")
             rows.append(row)
-            break  # a wedged board makes further runs meaningless
+            continue  # the board was reset; the next candidate gets a clean device
+        pcc, ms = res["pcc"], res["device_ms"]
         ok = pcc >= prog.min_pcc
         row.update(stage="ok" if ok else "pcc", pcc=pcc, device_ms=ms)
         est = f"  estimate={row['estimate']}" if row["estimate"] is not None else ""
