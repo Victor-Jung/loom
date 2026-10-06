@@ -62,14 +62,15 @@ def test_intermediate_gets_its_own_buffer(split_output: str) -> None:
 
 
 def test_broadcast_result_survives_to_its_consumer(split_output: str) -> None:
-    """The second op must still read the broadcast, and neither op may write the
-    buffer the broadcast produced into."""
+    """The second op must still read the broadcast, and the first op must not
+    write the buffer the broadcast produced into. The second op may finish in
+    place in that buffer: it reads and writes each element at the same index."""
     bcast = re.search(r"(%\w+) = loom\.broadcast ins\([^)]*\) outs\((%\w+)", split_output)
     assert bcast, split_output
     bcast_result, bcast_dest = bcast.group(1), bcast.group(2)
 
     generics = _generics(split_output)
     assert bcast_result in generics[1][0], "second op no longer reads the broadcast"
-    for ins, outs in generics:
-        dest = outs.split(":")[0].strip()
-        assert dest != bcast_dest, f"chain still writes the broadcast's buffer {dest}"
+    first_dest = generics[0][1].split(":")[0].strip()
+    assert first_dest != bcast_dest, f"the intermediate is parked in the broadcast's buffer {first_dest}"
+    assert first_dest in generics[1][0], "second op does not read the intermediate"
