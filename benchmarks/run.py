@@ -184,10 +184,10 @@ def main() -> None:
     prog = PROGRAMS[a.program]
     if a.shape:
         prog = Program(prog.kernel, prog.config, prog.reference, a.shape, prog.min_pcc)
-    tag = a.tag or ((a.tune or "untuned") + ("_hoist" if a.tune_hoist else "") + (f"_{a.shape}" if a.shape else ""))
+    tag = a.tag or ((a.tune or "maxpar") + ("_hoist" if a.tune_hoist else "") + (f"_{a.shape}" if a.shape else ""))
     rows: list[dict] = []
 
-    print(f"== {a.program}  policy={a.tune or 'none'} {a.tune_options}")
+    print(f"== {a.program}  policy={a.tune or 'maxpar (default)'} {a.tune_options}")
     t0 = time.perf_counter()
     out = Path("test/bench") / a.program / tag
     if a.reuse and (ROOT / out / "IRs" / "p03_bufferized.mlir").exists():

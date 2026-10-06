@@ -285,6 +285,10 @@ def run_pipeline(
 ) -> None:
     """Run the full Loom compilation pipeline.
 
+    ``tune=None`` runs the ``maxpar`` policy: the exploration requires the
+    spatial loops to be split to core counts, which the tuner does from
+    the hardware spec's mesh.
+
     Parameters
     ----------
     generate_mlir_fn:
@@ -331,9 +335,10 @@ def run_pipeline(
     # Step 0: Helion frontend
     mlir_text = run_step_0_frontend(generate_mlir_fn, ir_dir, debug)
 
-    # Step 0b (optional): mapping-program tuning
-    if tune is not None:
-        mlir_text = run_step_0b_tune(mlir_text, tune, tune_options, tune_hoist, ir_dir, debug, hw_spec)
+    # Step 0b: mapping-program tuning. The exploration needs the spatial
+    # loops split to core counts, so the default policy is maxpar.
+    mlir_text = run_step_0b_tune(mlir_text, tune or "maxpar", tune_options, tune_hoist,
+                                 ir_dir, debug, hw_spec)
 
     has_assigned_block_size = bool(assigned_block_size)
     needs_manual_etg = (

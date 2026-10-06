@@ -19,6 +19,11 @@ HW_SPEC = ROOT / "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x1y1.mlir"
 loom_pipeline = pytest.importorskip("loom_pipeline")
 
 
+def presplit(p00: str) -> str:
+    """The exploration only places spatial loops the tuner split (maxpar)."""
+    return loom_pipeline.run_mapping_tune(p00, "maxpar", "", False, str(HW_SPEC))
+
+
 def sum_of_inputs_p00(n: int, m: int = 256, cols: int = 512) -> str:
     """Stage-00 program out[m, n] = sum_i x_i[m, n] with one tile per input."""
     args = ", ".join(f"%x{i}: memref<{m}x{cols}xf16>" for i in range(n))
@@ -72,7 +77,7 @@ def explore(p00: str) -> str:
     if not HW_SPEC.exists():
         pytest.skip(f"hardware spec missing: {HW_SPEC}")
     out, _ = loom_pipeline.run_exploration(
-        input_mlir=p00, hw_spec_file=str(HW_SPEC), produce_etg=False
+        input_mlir=presplit(p00), hw_spec_file=str(HW_SPEC), produce_etg=False
     )
     return out
 

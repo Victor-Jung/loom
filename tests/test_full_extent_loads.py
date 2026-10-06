@@ -26,12 +26,17 @@ HW_SPEC = ROOT / "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x1y1.mlir"
 loom_pipeline = pytest.importorskip("loom_pipeline")
 
 
+def presplit(p00: str) -> str:
+    """The exploration only places spatial loops the tuner split (maxpar)."""
+    return loom_pipeline.run_mapping_tune(p00, "maxpar", "", False, str(HW_SPEC))
+
+
 @pytest.fixture(scope="module")
 def explored() -> str:
     if not HW_SPEC.exists():
         pytest.skip(f"hardware spec missing: {HW_SPEC}")
     out, _ = loom_pipeline.run_exploration(
-        input_mlir=FIXTURE.read_text(), hw_spec_file=str(HW_SPEC), produce_etg=True
+        input_mlir=presplit(FIXTURE.read_text()), hw_spec_file=str(HW_SPEC), produce_etg=True
     )
     return out
 
