@@ -39,8 +39,10 @@ def _gqa_decode(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> t
         qk_scale_dev = hl.full([], sm_scale, dtype=torch.float16)
         m_i = hl.full([tile_b, tile_m, 1], float("-inf"), dtype=torch.float16)
         l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float16)
         q = q_view[tile_b, tile_m, :]
+        # zeros_like keeps the loaded block's width: a specialized non-power-of-two
+        # width in hl.zeros is rounded up to the next power of two by Helion.
+        acc = torch.zeros_like(q)
         for tile_n in hl.tile(v_view.size(1)):
             k = set_memory_space(k_view[tile_b, :, tile_n], local_mem_kind=1)
             qk = torch.bmm(q, k)
@@ -58,7 +60,7 @@ def _gqa_decode(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor) -> t
             l_i = l_i * alpha + l_ij
             m_i = m_ij
         m_i += torch.log(l_i)
-        l_i_broadcast = broadcast(l_i, 2, [l_i.size(0), l_i.size(1), head_dim])
+        l_i_broadcast = broadcast(l_i, 2, [l_i.size(0), l_i.size(1), q.size(2)])
         acc = acc / l_i_broadcast
         out_[tile_b, tile_m, :] = acc.to(out_.dtype)
     return out_.view(q_in.size())

@@ -279,13 +279,13 @@ PROGRAMS: dict[str, Program] = {
         reference=_rmsnorm_residual,
     ),
     "mla_decode": Program(
-        # The GQA decode kernel with all 128 heads as query rows over the 576-wide
-        # latent; the host passes the latent cache as both K and V (two reads). D is
-        # 512 (no rope columns): the frontend rounds a 576-wide specialized dim to 1024.
+        # The GQA decode kernel with the heads as query rows over the 576-wide latent
+        # (512 + 64 rope columns); the host passes the latent cache as both K and V
+        # (two reads). 32 heads: DeepSeek-V3 with tensor parallelism 4.
         kernel="kernels/gqa_decode.py",
         config="kernels/config_files/mla_decode.json",
         reference=_gqa_decode,
-        shape="B8_G1_S4096_D512_ROWS128",
+        shape="B8_G1_S4096_D576_ROWS32",
     ),
     "gqa_prefill": Program(
         kernel="kernels/gqa_prefill.py",
