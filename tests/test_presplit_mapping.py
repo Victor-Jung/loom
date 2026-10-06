@@ -110,8 +110,11 @@ def test_beam_with_the_mesh_returns_distinct_presplit_trees() -> None:
     names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
     assert len(names) == len(set(names)) and names, names
     assert result.stdout.count("loom.block_syms = [") == len(names)
+    # Trading cores for multicast: the head loop over 8 cores (cb and C are
+    # invariant in h) on 80 cores is rated below maxpar's 120-core tree.
     estimates = [float(e) for e in re.findall(r"loop tree \(after, \S+ estimate ([0-9.e+]+)\)", result.stderr)]
-    assert estimates and max(estimates) <= 1.14e7, estimates
+    assert estimates and min(estimates) < 1.13e7, estimates
+    assert any("h8" in n for n in names), names
 
 
 def test_temporalize_after_split_keeps_the_recomposition_on_its_axis() -> None:
