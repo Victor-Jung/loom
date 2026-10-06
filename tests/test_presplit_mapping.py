@@ -61,13 +61,17 @@ def test_explorer_rejects_axes_that_do_not_fit() -> None:
 
 
 def test_split_emits_a_constant_axis_and_a_wave_loop() -> None:
+    # With a mesh every candidate is completed by maxpar, so the remaining
+    # axes are split too: m over 8 and n over 4 next to b's 2 (2*4 on x, 8 on y).
     result = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=fixed",
                   "options=split(b,2)", f"hw-spec={HW12x10}")
     assert result.returncode == 0, result.stderr[-2000:]
     out = result.stdout
-    assert re.search(r"affine\.parallel \(%\w+, %\w+\) = \(0, 0\) to \(symbol\(%\w+\), 2\)", out), out
-    assert "arith.ceildivui %" in out and "affine.apply" in out
+    assert re.search(r"affine\.parallel \(%\w+, %\w+, %\w+\) = \(0, 0, 0\) to \(8, 2, 4\)", out), out
+    assert "loom.block_syms = [@tile_m, @tile_b, @tile_n]" in out
+    assert "affine.apply" in out
     assert "loom.block_sym = @tile_b, loom.iter_type = #loom.iter_type<temporal>" in out
+    assert "loom.block_sym = @tile_m, loom.iter_type = #loom.iter_type<temporal>" in out
 
 
 def test_split_needs_the_mesh_and_a_dividing_core_count() -> None:
@@ -97,3 +101,17 @@ def test_maxpar_on_one_core_makes_every_axis_constant() -> None:
     result = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=maxpar", f"hw-spec={HW1x1}")
     assert result.returncode == 0, result.stderr[-2000:]
     assert "affine.parallel (%arg3) = (0) to (1)" in result.stdout
+
+
+def test_beam_with_the_mesh_returns_distinct_presplit_trees() -> None:
+    result = tune(FIXTURES / "etg_mamba_p00.mlir", "policy=beam",
+                  "options=width=4;depth=5;keep=3", f"hw-spec={HW12x10}", "dump-tree")
+    assert result.returncode == 0, result.stderr[-2000:]
+    names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
+    assert len(names) == len(set(names)) and names, names
+    assert result.stdout.count("loom.block_syms = [") == len(names)
+    # The parallel term lets the beam spatialize the head loop (h over 2
+    # cores), along which cb and C are invariant: fewer DRAM bytes than
+    # maxpar's c10 x m6 x n2 for the same 120 cores.
+    estimates = [float(e) for e in re.findall(r"loop tree \(after, \S+ estimate ([0-9.e+]+)\)", result.stderr)]
+    assert estimates and min(estimates) < 1.13e7, estimates
