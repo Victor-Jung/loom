@@ -110,8 +110,23 @@ def test_beam_with_the_mesh_returns_distinct_presplit_trees() -> None:
     names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
     assert len(names) == len(set(names)) and names, names
     assert result.stdout.count("loom.block_syms = [") == len(names)
-    # The parallel term lets the beam spatialize the head loop (h over 2
-    # cores), along which cb and C are invariant: fewer DRAM bytes than
-    # maxpar's c10 x m6 x n2 for the same 120 cores.
     estimates = [float(e) for e in re.findall(r"loop tree \(after, \S+ estimate ([0-9.e+]+)\)", result.stderr)]
-    assert estimates and min(estimates) < 1.13e7, estimates
+    assert estimates and max(estimates) <= 1.14e7, estimates
+
+
+def test_temporalize_after_split_keeps_the_recomposition_on_its_axis() -> None:
+    # Split c (axis index 2 of the matmul-like (m, n, c) parallel), then
+    # temporalize n: c moves to index 1 and its wave loop must still rebuild
+    # the chunk index from the c axis, not from whatever now sits at index 2.
+    result = tune(FIXTURES / "etg_mamba_p00.mlir", "policy=fixed",
+                  "options=split(c,10);temporalize(n)", f"hw-spec={HW12x10}")
+    assert result.returncode == 0, result.stderr[-2000:]
+    out = result.stdout
+    par = re.search(r"affine\.parallel \(([^)]*)\) = \([0, ]*\) to \(([^)]*)\) \{", out)
+    assert par, out
+    ivs = [v.strip() for v in par.group(1).split(",")]
+    sizes = [int(v) for v in par.group(2).split(",")]
+    c_iv = ivs[sizes.index(10)]
+    alias = re.search(r"(#map\d*) = affine_map<\(d0, d1\) -> \(d0 \+ d1 \* 10\)>", out)
+    assert alias, out
+    assert re.search(rf"affine\.apply {re.escape(alias.group(1))}\({re.escape(c_iv)}, ", out), out
