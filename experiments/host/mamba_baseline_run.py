@@ -26,6 +26,8 @@ ap.add_argument("--CS", type=int, default=192)
 ap.add_argument("--causal", default="element", choices=["none", "block", "element"])
 ap.add_argument("--bench", action="store_true")
 ap.add_argument("--iters", type=int, default=5)
+ap.add_argument("--fidelity", default="HiFi4", choices=["LoFi", "HiFi2", "HiFi3", "HiFi4"])
+ap.add_argument("--no-approx", action="store_true")
 a = ap.parse_args()
 B, L, H, Dh, G, ds, CS = a.B, a.L, a.H, a.Dh, a.G, a.ds, a.CS
 NC = L // CS
@@ -49,8 +51,12 @@ try:
     cb_tt, x_tt, dt_tt, dA_tt, C_tt, prev_tt, D_host = (
         mk(prepped[0]), mk(prepped[1]), mk(prepped[2]), mk(prepped[3]),
         mk(prepped[4]), mk(prepped[5]), prepped[6])
+    ckc = ttnn.init_device_compute_kernel_config(
+        dev.arch(), math_fidelity=getattr(ttnn.MathFidelity, a.fidelity),
+        math_approx_mode=not a.no_approx, fp32_dest_acc_en=False, packer_l1_acc=True)
+    print(f"PE kernel: fidelity {a.fidelity} approx {not a.no_approx} fp32_acc False packer_l1_acc True")
     kw = dict(batch=B, nchunks=NC, ngroups=G, chunk_size=CS, seqlen=L,
-              nheads=H, headdim=Dh, dstate=ds)
+              nheads=H, headdim=Dh, dstate=ds, compute_kernel_config=ckc)
 
     t0 = time.perf_counter()
     outs = ttnn_mamba2_chunk_scan_compute(cb_tt, x_tt, dt_tt, dA_tt, C_tt,

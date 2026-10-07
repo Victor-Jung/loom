@@ -107,6 +107,7 @@ def ttnn_mamba2_chunk_scan_compute_coarse_causal(
     block_size: int,
     dtype=ttnn.bfloat16,
     memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    compute_kernel_config=None,
 ):
     """
     TTNN compute-only Mamba2 chunk scan with coarse-grained causal mask.
@@ -187,6 +188,7 @@ def ttnn_mamba2_chunk_scan_compute_coarse_causal(
                     C_local,
                     prev_local,
                     memory_config=memory_config,
+                    compute_kernel_config=compute_kernel_config,
                     dtype=dtype,
                 )
 
@@ -284,6 +286,7 @@ def ttnn_mamba2_chunk_scan_compute_coarse_causal(
                             scan_weight_mk,
                             x_k,
                             memory_config=memory_config,
+                            compute_kernel_config=compute_kernel_config,
                             dtype=dtype,
                         )
 
@@ -338,6 +341,7 @@ def ttnn_mamba2_chunk_scan_compute(
     nheads: int,
     headdim: int,
     dstate: int,
+    compute_kernel_config=None,
 ):
     """
     Compute-only TTNN implementation.
@@ -418,6 +422,7 @@ def ttnn_mamba2_chunk_scan_compute(
                     C_local,
                     prev_local,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    compute_kernel_config=compute_kernel_config,
                     dtype=ttnn.bfloat16,
                 )
 
@@ -502,6 +507,7 @@ def ttnn_mamba2_chunk_scan_compute(
                     scan_weight,
                     x_local,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    compute_kernel_config=compute_kernel_config,
                     dtype=ttnn.bfloat16,
                 )
 

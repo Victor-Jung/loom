@@ -169,15 +169,25 @@ def reset_board() -> None:
     subprocess.run(RESET_CMD, capture_output=True, timeout=300)
 
 
+def pe_env(fidelity: str, approx: bool) -> dict:
+    """Environment that pins the generated host's per-core compute settings."""
+    env = dict(os.environ)
+    env["LOOM_MATH_FIDELITY"] = fidelity
+    env["LOOM_MATH_APPROX"] = "1" if approx else "0"
+    return env
+
+
 def run_candidate_in_process(program: str, kdir: Path, shapes: list[list[int]],
-                             iters: int, warmup: int, timeout_s: int) -> dict:
+                             iters: int, warmup: int, timeout_s: int,
+                             fidelity: str = "HiFi4", approx: bool = True) -> dict:
     """Run one candidate in a child process so a hung kernel cannot take the
     other candidates with it. On a timeout the child is killed and the board
     reset before the next candidate."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", program,
            str(kdir), json.dumps(shapes), str(iters), str(warmup)]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=ROOT)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=ROOT,
+                             env=pe_env(fidelity, approx))
     except subprocess.TimeoutExpired:
         reset_board()
         return {"stage": "run", "error": f"hang: no result within {timeout_s} s; board reset"}
@@ -218,6 +228,10 @@ def main() -> None:
                     help="skip compilation and lowering when their outputs already exist")
     ap.add_argument("--timeout", type=int, default=180,
                     help="seconds a candidate may take on the device before it counts as a hang")
+    ap.add_argument("--fidelity", default="HiFi4", choices=["LoFi", "HiFi2", "HiFi3", "HiFi4"],
+                    help="math fidelity of every compute kernel (match it in any comparison)")
+    ap.add_argument("--no-approx", action="store_true",
+                    help="exact SFPU math (math_approx_mode off); the kernels' exp is approximate regardless")
     ap.add_argument("--reset-each", action="store_true",
                     help="reset the board before every candidate, not only after a failure")
     a = ap.parse_args()
@@ -225,10 +239,13 @@ def main() -> None:
     prog = PROGRAMS[a.program]
     if a.shape:
         prog = Program(prog.kernel, prog.config, prog.reference, a.shape, prog.min_pcc)
-    tag = a.tag or ((a.tune or "maxpar") + ("_hoist" if a.tune_hoist else "") + (f"_{a.shape}" if a.shape else ""))
+    approx = not a.no_approx
+    pe = {"math_fidelity": a.fidelity, "math_approx_mode": approx, "fp32_dest_acc_en": False, "data_format": "bf16"}
+    tag = a.tag or ((a.tune or "maxpar") + ("_hoist" if a.tune_hoist else "") + (f"_{a.shape}" if a.shape else "")
+                    + f"_{a.fidelity}" + ("" if approx else "_exact"))
     rows: list[dict] = []
 
-    print(f"== {a.program}  policy={a.tune or 'maxpar (default)'} {a.tune_options}")
+    print(f"== {a.program}  policy={a.tune or 'maxpar (default)'} {a.tune_options}  PE kernel: {pe}")
     t0 = time.perf_counter()
     out = Path("test/bench") / a.program / tag
     if a.reuse and (ROOT / out / "IRs" / "p03_bufferized.mlir").exists():
@@ -238,7 +255,7 @@ def main() -> None:
                                    a.per_order)
     compile_s = time.perf_counter() - t0
     stage_ms = parse_stage_times(log)
-    summary = {"compile_wall_s": round(compile_s, 1), "stage_ms": stage_ms}
+    summary = {"compile_wall_s": round(compile_s, 1), "stage_ms": stage_ms, "pe_kernel": pe}
     print("compile: " + f"{compile_s:.0f} s wall; " +
           ", ".join(f"{k.split(':', 1)[0]}={v / 1000:.1f}s" for k, v in stage_ms.items()))
     if not (ROOT / out / "IRs" / "p03_bufferized.mlir").exists():
@@ -272,7 +289,8 @@ def main() -> None:
             continue
         if a.reset_each:
             reset_board()
-        res = run_candidate_in_process(a.program, kdir, arg_shapes(out, func), a.iters, a.warmup, a.timeout)
+        res = run_candidate_in_process(a.program, kdir, arg_shapes(out, func), a.iters, a.warmup, a.timeout,
+                                       a.fidelity, approx)
         if "error" in res:
             row.update(res)
             print(f"[{i}] {base[:60]}  run FAILED: {res['error'][:120]}")

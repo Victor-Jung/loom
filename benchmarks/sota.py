@@ -12,8 +12,16 @@ For every program the yardsticks are:
 Baselines run on the same random inputs as the Loom kernel (seed 0) and are
 checked against the program's golden reference, each in its own process.
 
-    python benchmarks/sota.py gqa_decode --param groups=8
-    python benchmarks/sota.py mask_softmax
+Both sides run the same PE kernel (per-core compute settings): every ttnn op
+that takes a compute_kernel_config gets one built from --fidelity and
+--no-approx, with fp32 destination accumulation off and packer L1
+accumulation on, as in the generated Loom kernels; the Loom rows listed are
+the ones run with the same settings (benchmarks/run.py --fidelity). The
+fused ttnn operators are swept over their program configs (chunk sizes) and
+every point is reported, so ttnn is not judged at an untuned default.
+
+    python benchmarks/sota.py gqa_decode --param groups=8 --fidelity HiFi4
+    python benchmarks/sota.py mask_softmax --fidelity HiFi2
 """
 
 from __future__ import annotations
@@ -48,6 +56,28 @@ def _to_dev(ttnn, d, t):
                            device=d, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
+def _ckc(ttnn, d, params):
+    """The compute kernel config both sides run with (see the module docstring)."""
+    return ttnn.init_device_compute_kernel_config(
+        d.arch(),
+        math_fidelity=getattr(ttnn.MathFidelity, params["fidelity"]),
+        math_approx_mode=params["approx"],
+        fp32_dest_acc_en=False,
+        packer_l1_acc=True,
+    )
+
+
+def _sdpa_cfg(ttnn, d, params):
+    """Program config of the SDPA family from the sweep point, or None for ttnn's default."""
+    if "q_chunk" not in params and "k_chunk" not in params:
+        return None
+    grid = d.compute_with_storage_grid_size()
+    return ttnn.SDPAProgramConfig(compute_with_storage_grid_size=(grid.x, grid.y),
+                                  q_chunk_size=int(params.get("q_chunk", 32)),
+                                  k_chunk_size=int(params.get("k_chunk", 32)),
+                                  exp_approx_mode=params["approx"])
+
+
 def gqa_decode_fused(ttnn, d, ins, shapes, params):
     """ttnn.transformer.scaled_dot_product_attention_decode on the real heads.
 
@@ -67,8 +97,11 @@ def gqa_decode_fused(ttnn, d, ins, shapes, params):
     s = k_tt.shape[2]
     cur_pos = [s - 1] * b
 
+    cfg, ckc = _sdpa_cfg(ttnn, d, params), _ckc(ttnn, d, params)
+
     def run():
-        return ttnn.transformer.scaled_dot_product_attention_decode(q_tt, k_tt, v_tt, is_causal=True, cur_pos=cur_pos)
+        return ttnn.transformer.scaled_dot_product_attention_decode(q_tt, k_tt, v_tt, is_causal=True, cur_pos=cur_pos,
+                                                                     program_config=cfg, compute_kernel_config=ckc)
 
     out = ttnn.to_torch(run()).float()[0]                             # [b, nh, dh]
     full = torch.zeros(b, groups, rows, dh)
@@ -81,11 +114,13 @@ def gqa_decode_composite(ttnn, d, ins, shapes, params):
     q_tt, kt_tt, v_tt = (_to_dev(ttnn, d, t) for t in (q_pad, kt, v))
     scale = 1.0 / math.sqrt(q_pad.shape[-1])
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        s = ttnn.matmul(q_tt, kt_tt)
+        s = ttnn.matmul(q_tt, kt_tt, compute_kernel_config=ckc)
         s = ttnn.multiply(s, scale)
-        p = ttnn.softmax(s, dim=-1)
-        return ttnn.matmul(p, v_tt)
+        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        return ttnn.matmul(p, v_tt, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
 
@@ -98,8 +133,10 @@ def mask_softmax_fused(ttnn, d, ins, shapes, params):
     m_tt = _to_dev(ttnn, d, mask.reshape(1, 1, *mask.shape).expand(x.shape[0], 1, *mask.shape).contiguous())
     scale = 1.0 / math.sqrt(x.shape[-1])
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        return ttnn.scale_mask_softmax_in_place(x_tt, scale, m_tt, is_causal_mask=True)
+        return ttnn.scale_mask_softmax_in_place(x_tt, scale, m_tt, is_causal_mask=True, compute_kernel_config=ckc)
 
     out = ttnn.to_torch(run()).float()
     # In place: the timed runs re-normalize an already normalized tensor, which
@@ -113,10 +150,12 @@ def mask_softmax_composite(ttnn, d, ins, shapes, params):
     m_tt = _to_dev(ttnn, d, mask.reshape(1, 1, *mask.shape))
     scale = 1.0 / math.sqrt(x.shape[-1])
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
         s = ttnn.multiply(x_tt, scale)
         s = ttnn.add(s, m_tt)
-        return ttnn.softmax(s, dim=-1)
+        return ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
 
@@ -134,8 +173,10 @@ def rmsnorm_fused(ttnn, d, ins, shapes, params):
     x, res, w, ref = _rmsnorm_parts(ins)
     x_tt, r_tt, w_tt = (_to_dev(ttnn, d, t) for t in (x, res, w))
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        return ttnn.rms_norm(x_tt, epsilon=1e-5, weight=w_tt, residual_input_tensor=r_tt)
+        return ttnn.rms_norm(x_tt, epsilon=1e-5, weight=w_tt, residual_input_tensor=r_tt, compute_kernel_config=ckc)
 
     out = ttnn.to_torch(run()).float()
     return out, run, lambda _golden: _pcc(out, ref)
@@ -144,6 +185,8 @@ def rmsnorm_fused(ttnn, d, ins, shapes, params):
 def rmsnorm_composite(ttnn, d, ins, shapes, params):
     x, res, w, ref = _rmsnorm_parts(ins)
     x_tt, r_tt, w_tt = (_to_dev(ttnn, d, t) for t in (x, res, w))
+
+    ckc = _ckc(ttnn, d, params)
 
     def run():
         h = ttnn.add(x_tt, r_tt)
@@ -166,16 +209,11 @@ def mla_decode_fused(ttnn, d, ins, shapes, params):
     k_tt = _to_dev(ttnn, d, kv.unsqueeze(1))
     cur_pos = [kv.shape[1] - 1] * b
 
-    cfg = None
-    if hasattr(ttnn, "SDPAProgramConfig"):
-        # The default config allocates 5.7 MB of L1 for 128 heads x 512 at 4096
-        # positions; smaller chunks fit.
-        cfg = ttnn.SDPAProgramConfig(compute_with_storage_grid_size=(12, 10), q_chunk_size=32,
-                                     k_chunk_size=int(params.get("k_chunk", 128)), exp_approx_mode=False)
+    cfg, ckc = _sdpa_cfg(ttnn, d, params), _ckc(ttnn, d, params)
 
     def run():
         return ttnn.transformer.flash_multi_latent_attention_decode(q_tt, k_tt, dv, is_causal=True, cur_pos=cur_pos,
-                                                                    program_config=cfg)
+                                                                    program_config=cfg, compute_kernel_config=ckc)
 
     out = ttnn.to_torch(run()).float()[0]
     # Loom's program reads independent random tensors for the two views, so the
@@ -198,11 +236,13 @@ def mla_decode_composite(ttnn, d, ins, shapes, params):
     kvt_tt = _to_dev(ttnn, d, kvt)
     scale = 1.0 / math.sqrt(q.shape[-1])
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        s = ttnn.matmul(q_tt, kvt_tt)
+        s = ttnn.matmul(q_tt, kvt_tt, compute_kernel_config=ckc)
         s = ttnn.multiply(s, scale)
-        p = ttnn.softmax(s, dim=-1)
-        return ttnn.matmul(p, kv_tt)
+        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        return ttnn.matmul(p, kv_tt, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
 
@@ -216,8 +256,11 @@ def gqa_prefill_fused(ttnn, d, ins, shapes, params):
     k_tt = _to_dev(ttnn, d, kt.transpose(1, 2).contiguous().unsqueeze(0))
     v_tt = _to_dev(ttnn, d, v.unsqueeze(0))
 
+    cfg, ckc = _sdpa_cfg(ttnn, d, params), _ckc(ttnn, d, params)
+
     def run():
-        return ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=False)
+        return ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=False,
+                                                             program_config=cfg, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float()[0], run, None
 
@@ -232,11 +275,13 @@ def gqa_prefill_composite(ttnn, d, ins, shapes, params):
     q_tt, kt_tt, v_tt = (_to_dev(ttnn, d, t) for t in (q, kt[g].contiguous(), v[g].contiguous()))
     scale = 1.0 / math.sqrt(q.shape[-1])
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        s = ttnn.matmul(q_tt, kt_tt)
+        s = ttnn.matmul(q_tt, kt_tt, compute_kernel_config=ckc)
         s = ttnn.multiply(s, scale)
-        p = ttnn.softmax(s, dim=-1)
-        return ttnn.matmul(p, v_tt)
+        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        return ttnn.matmul(p, v_tt, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
 
@@ -269,8 +314,11 @@ def rotary_fused(ttnn, d, ins, shapes, params):
     sin_tt = _to_dev(ttnn, d, sin.reshape(1, 1, t, dh))
     trans_tt = _to_dev(ttnn, d, pair_rotation_matrix(32).reshape(1, 1, 32, 32))
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        return ttnn.experimental.rotary_embedding_llama(x_tt, cos_tt, sin_tt, trans_tt, is_decode_mode=False)
+        return ttnn.experimental.rotary_embedding_llama(x_tt, cos_tt, sin_tt, trans_tt, is_decode_mode=False,
+                                                        compute_kernel_config=ckc)
 
     out = ttnn.to_torch(run()).float()[0]
     ref = x.float() * cos.float() + (x.float() @ pair_rotation_matrix(dh)) * sin.float()
@@ -281,8 +329,10 @@ def rotary_composite(ttnn, d, ins, shapes, params):
     x, cos, sin, rot = _rotary_parts(ins)
     x_tt, cos_tt, sin_tt, rot_tt = (_to_dev(ttnn, d, t) for t in (x, cos.unsqueeze(0), sin.unsqueeze(0), rot))
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        r = ttnn.matmul(x_tt, rot_tt)
+        r = ttnn.matmul(x_tt, rot_tt, compute_kernel_config=ckc)
         return ttnn.add(ttnn.multiply(x_tt, cos_tt), ttnn.multiply(r, sin_tt))
 
     return ttnn.to_torch(run()).float(), run, None
@@ -293,8 +343,10 @@ def gemm_bias_exp_fused(ttnn, d, ins, shapes, params):
     a, b, bias = ins
     a_tt, b_tt, bias_tt = (_to_dev(ttnn, d, t) for t in (a, b, bias))
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        y = ttnn.linear(a_tt, b_tt, bias=bias_tt)
+        y = ttnn.linear(a_tt, b_tt, bias=bias_tt, compute_kernel_config=ckc)
         return ttnn.exp(ttnn.multiply(y, 1.0 / 64.0))
 
     return ttnn.to_torch(run()).float(), run, None
@@ -304,11 +356,29 @@ def gemm_bias_exp_composite(ttnn, d, ins, shapes, params):
     a, b, bias = ins
     a_tt, b_tt, bias_tt = (_to_dev(ttnn, d, t) for t in (a, b, bias))
 
+    ckc = _ckc(ttnn, d, params)
+
     def run():
-        y = ttnn.add(ttnn.matmul(a_tt, b_tt), bias_tt)
+        y = ttnn.add(ttnn.matmul(a_tt, b_tt, compute_kernel_config=ckc), bias_tt)
         return ttnn.exp(ttnn.multiply(y, 1.0 / 64.0))
 
     return ttnn.to_torch(run()).float(), run, None
+
+
+def gemm_linear_only(ttnn, d, ins, shapes, params):
+    """Reference, not the same computation: ttnn.linear with the bias and no scale/exp
+    epilogue, to split the fused baseline's time into matmul and epilogue."""
+    import torch
+    a, b, bias = ins
+    a_tt, b_tt, bias_tt = (_to_dev(ttnn, d, t) for t in (a, b, bias))
+    ckc = _ckc(ttnn, d, params)
+
+    def run():
+        return ttnn.linear(a_tt, b_tt, bias=bias_tt, compute_kernel_config=ckc)
+
+    out = ttnn.to_torch(run()).float()
+    ref = a.float() @ b.float() + bias.float()
+    return out, run, lambda _golden: _pcc(out, ref)
 
 
 BASELINES = {
@@ -318,8 +388,25 @@ BASELINES = {
     "mla_decode": {"ttnn fused": mla_decode_fused, "ttnn composite": mla_decode_composite},
     "gqa_prefill": {"ttnn fused": gqa_prefill_fused, "ttnn composite": gqa_prefill_composite},
     "rotary": {"ttnn fused": rotary_fused, "ttnn composite": rotary_composite},
-    "gemm_bias_exp_full": {"ttnn linear+bias, exp": gemm_bias_exp_fused, "ttnn composite": gemm_bias_exp_composite},
+    # ttnn.linear cannot fuse exp as an activation ("Unsupported activation
+    # function"), so the epilogue runs as separate ops.
+    "gemm_bias_exp_full": {"ttnn linear+bias, exp": gemm_bias_exp_fused, "ttnn composite": gemm_bias_exp_composite,
+                           "ttnn linear+bias only (reference)": gemm_linear_only},
 }
+
+
+# Program-config sweep per fused operator: every point is run and reported.
+SWEEPS = {
+    ("gqa_decode", "ttnn fused"): [{}] + [{"k_chunk": k} for k in (64, 128, 256, 512)],
+    ("mla_decode", "ttnn fused"): [{}] + [{"k_chunk": k} for k in (64, 128, 256)],
+    ("gqa_prefill", "ttnn fused"): [{}] + [{"q_chunk": q, "k_chunk": k} for q in (64, 128, 256) for k in (64, 128, 256, 512)],
+}
+
+
+def _point_name(name: str, point: dict) -> str:
+    if not point:
+        return f"{name} (default cfg)"
+    return name + " " + " ".join(f"{k.split('_')[0]}{v}" for k, v in point.items())
 
 
 def roofline_bytes(program: str, shapes: list[list[int]], params: dict) -> int:
@@ -376,16 +463,19 @@ def run_baseline(program, baseline, shapes, params, iters, warmup, timeout_s) ->
 
 
 def loom_results(program: str) -> list[dict]:
-    """Best passing candidate per tag from benchmarks/run.py."""
+    """Best passing candidate per tag from benchmarks/run.py, with the PE kernel it ran
+    (results written before the PE kernel was recorded have none and are skipped)."""
     rows = []
     for res in sorted((ROOT / "test/bench" / program).glob("*/results.json")):
         data = json.loads(res.read_text())
-        ok = [c for c in data["candidates"] if c.get("stage") == "ok"]
-        if not ok:
+        ran = [c for c in data["candidates"] if c.get("stage") in ("ok", "pcc")]
+        if not ran:
             continue
-        best = min(ok, key=lambda c: c["device_ms"])
+        ok = [c for c in ran if c["stage"] == "ok"]
+        best = min(ok or ran, key=lambda c: c["device_ms"])
         rows.append({"tag": res.parent.name, "function": best["function"], "device_ms": best["device_ms"],
-                     "pcc": best["pcc"], "out": str(res.parent.relative_to(ROOT))})
+                     "pcc": best["pcc"], "out": str(res.parent.relative_to(ROOT)),
+                     "pe_kernel": data["summary"].get("pe_kernel", {})})
     return rows
 
 
@@ -401,17 +491,24 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--reset-each", action="store_true")
+    ap.add_argument("--fidelity", default="HiFi4", choices=["LoFi", "HiFi2", "HiFi3", "HiFi4"])
+    ap.add_argument("--no-approx", action="store_true")
     ap.add_argument("--tag", default=None,
                     help="Loom result tag (test/bench/<program>/<tag>) whose shapes the baselines use; "
                          "only Loom rows of that shape are listed")
     a = ap.parse_args()
     params = dict(kv.split("=", 1) for kv in a.param)
+    params["fidelity"], params["approx"] = a.fidelity, not a.no_approx
+    pe = {"math_fidelity": a.fidelity, "math_approx_mode": not a.no_approx,
+          "fp32_dest_acc_en": False, "packer_l1_acc": True, "data_format": "bf16"}
 
-    loom = loom_results(a.program)
+    loom = [l for l in loom_results(a.program) if l.get("pe_kernel") == {k: pe[k] for k in l.get("pe_kernel", {})}
+            and l.get("pe_kernel", {}).get("math_fidelity") == a.fidelity]
     if a.tag:
         loom = [l for l in loom if l["tag"] == a.tag] + [l for l in loom if l["tag"] != a.tag]
     if not loom:
-        sys.exit(f"no passing Loom result under test/bench/{a.program}; run benchmarks/run.py first")
+        sys.exit(f"no Loom result that ran under test/bench/{a.program} at {a.fidelity}; "
+                 f"run benchmarks/run.py {a.program} --fidelity {a.fidelity} first")
     shapes = arg_shapes(Path(loom[0]["out"]), loom[0]["function"])
     loom = [l for l in loom if arg_shapes(Path(l["out"]), l["function"]) == shapes]
     bytes_once = roofline_bytes(a.program, shapes, params)
@@ -419,25 +516,34 @@ def main() -> None:
 
     rows = []
     for name in BASELINES[a.program]:
-        if a.reset_each:
-            reset_board()
-        r = run_baseline(a.program, name, shapes, params, a.iters, a.warmup, a.timeout)
-        rows.append({"name": name, **r})
+        for point in SWEEPS.get((a.program, name), [{}]):
+            if a.reset_each:
+                reset_board()
+            r = run_baseline(a.program, name, shapes, {**params, **point}, a.iters, a.warmup, a.timeout)
+            label = _point_name(name, point) if (a.program, name) in SWEEPS else name
+            rows.append({"name": label, "baseline": name, "program_config": point, **r})
     for l in loom:
         rows.append({"name": f"loom {l['tag']}", "pcc": l["pcc"], "device_ms": l["device_ms"], "function": l["function"]})
     rows.append({"name": "roofline (512 GB/s)", "device_ms": roof_ms, "bytes": bytes_once})
 
     print(f"== {a.program}  shapes={shapes}  params={params}")
-    print(f"{'yardstick':<28} {'ms':>8} {'x roof':>7} {'PCC':>9}")
+    print(f"   PE kernel (both sides): {pe}")
+    print(f"{'yardstick':<36} {'ms':>8} {'x roof':>7} {'PCC':>9}")
     for r in rows:
         if "error" in r:
-            print(f"{r['name']:<28} {'FAIL':>8}          {r['error'][:90]}")
+            print(f"{r['name']:<36} {'FAIL':>8}          {r['error'].splitlines()[0][:80] if r['error'] else ''}")
             continue
         pcc = f"{r['pcc']:.6f}" if "pcc" in r else ""
-        print(f"{r['name']:<28} {r['device_ms']:8.3f} {r['device_ms'] / roof_ms:7.2f} {pcc:>9}")
-    out = ROOT / "tmp_output/sota" / (f"{a.program}_{a.tag}.json" if a.tag else f"{a.program}.json")
+        print(f"{r['name']:<36} {r['device_ms']:8.3f} {r['device_ms'] / roof_ms:7.2f} {pcc:>9}")
+    for base in BASELINES[a.program]:
+        ok = [r for r in rows if r.get("baseline") == base and "device_ms" in r and r.get("pcc", 0) >= 0.99]
+        if ok:
+            best = min(ok, key=lambda r: r["device_ms"])
+            print(f"best {base}: {best['name']} {best['device_ms']:.3f} ms")
+    out = ROOT / "tmp_output/sota" / (f"{a.program}_{a.tag}.json" if a.tag else f"{a.program}_{a.fidelity}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"program": a.program, "shapes": shapes, "params": params, "rows": rows}, indent=2))
+    out.write_text(json.dumps({"program": a.program, "shapes": shapes, "params": params, "pe_kernel": pe,
+                               "rows": rows}, indent=2))
     print(f"results: {out.relative_to(ROOT)}")
 
 
