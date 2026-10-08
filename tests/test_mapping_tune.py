@@ -82,9 +82,10 @@ def test_enumerate_emits_one_function_per_loop_order() -> None:
 
 
 def test_greedy_moves_the_shared_operand_loop_innermost() -> None:
-    # s[m, n] is invariant in b: with b innermost its tile is reused across
-    # the batch, so the traffic estimate prefers order m, n, b.
-    result = tune(SCALED, "policy=greedy", "dump-tree=true")
+    # s[m, n] is invariant in b: with b innermost its tile can be reused
+    # across the batch. Under ideal reuse (every load assumed hoisted out of
+    # the loops it does not depend on) the estimate prefers order m, n, b.
+    result = tune(SCALED, "policy=greedy", "options=reuse=ideal", "dump-tree=true")
     assert result.returncode == 0, result.stderr[-2000:]
     after = result.stderr.split("loop tree (after", 1)[1]
     assert re.findall(r"L\d+ temporal (\w+)", after) == ["n", "b"]
@@ -94,7 +95,7 @@ def test_greedy_moves_the_shared_operand_loop_innermost() -> None:
 
 
 def test_hoist_moves_the_invariant_load_out_of_the_inner_loop() -> None:
-    result = tune(SCALED, "policy=greedy", "hoist=true")
+    result = tune(SCALED, "policy=greedy", "options=reuse=ideal", "hoist=true")
     assert result.returncode == 0, result.stderr[-2000:]
     ir = result.stdout
     # s (%arg1) is loaded between the n loop and the b loop; x (%arg0), which
@@ -121,8 +122,9 @@ def test_random_returns_distinct_legal_trees() -> None:
     names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
     assert names and len(names) == len(set(names)), names
     for name in names:
-        assert name == "_matmul" or (name.startswith("_matmul__order_")
-                                     and name.endswith("_k")), name
+        order = re.sub(r"(_h\d+o(\d+|f))+$", "", name)  # statement placement
+        assert order == "_matmul" or (order.startswith("_matmul__order_")
+                                      and order.endswith("_k")), name
 
 
 def test_spatialize_adds_an_axis_and_hoists_its_bound() -> None:
@@ -161,15 +163,17 @@ def test_temporalize_then_spatialize_round_trips() -> None:
 
 
 def test_beam_ranks_the_multicast_and_interchange_trees_first() -> None:
-    # s[m, n] is invariant in b. Both making b spatial (multicast) and moving
-    # it innermost (reuse) cut its traffic to one fetch; the untuned order
-    # refetches it per b.
-    result = tune(SCALED, "policy=beam", "options=width=4;depth=4;keep=3", "dump-tree")
+    # s[m, n] is invariant in b. Making b spatial (multicast) cuts its
+    # traffic to one fetch; so does moving b innermost and hoisting s's load
+    # out of it (the generated code reloads a tile on every iteration of a
+    # loop around it, so the interchange alone does not). The untuned order
+    # refetches s per b.
+    result = tune(SCALED, "policy=beam", "options=width=4;depth=4;keep=8", "dump-tree")
     assert result.returncode == 0, result.stderr[-2000:]
     names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
-    assert len(names) == 3, names
     assert "_scaled_ewise__order_m_b_n" not in names, names
-    assert {"_scaled_ewise__order_m_n_b", "_scaled_ewise__order_bSm_n"} <= set(names), names
+    assert "_scaled_ewise__order_bSm_n" in names, names
+    assert any(re.fullmatch(r"_scaled_ewise__order_m_n_b_h\d+o\d+", n) for n in names), names
     estimates = [float(e) for e in re.findall(r"estimate ([0-9.e+]+)\)", result.stderr)]
     assert estimates[0] > min(estimates[1:]), estimates
 
