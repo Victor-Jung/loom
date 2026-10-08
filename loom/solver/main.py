@@ -96,8 +96,11 @@ def _collect_iter_num_constraints(
 
     for i, raw_temp_iter in enumerate(iter_num.get("temp_iter", [])):
         label = f"iter_num.temp_iter[{i}]"
-        temp_iter, _ = _unpack_iter_num(raw_temp_iter, label)
-        if _contains_symbol(temp_iter, "tile_b"):
+        temp_iter, asure_divisible = _unpack_iter_num(raw_temp_iter, label)
+        # A wave loop of a split (flagged asure_divisible by the ETG) may end
+        # in a partial wave, so it never takes the divisibility of the
+        # sequential batch loop.
+        if _contains_symbol(temp_iter, "tile_b") and not asure_divisible:
             seq_exprs.append(temp_iter)
             seq_labels.append(label)
         else:

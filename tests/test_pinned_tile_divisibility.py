@@ -43,17 +43,14 @@ def _divisible(variant: dict) -> list:
             if "Divisible" in c]
 
 
-def test_chunk_split_divides_the_chunk_count(variants: list) -> None:
-    # maxpar splits the chunk loop over 10 cores on the 12x10 mesh; every
-    # placement constrains tile_c by the chunk count, never by its upper
-    # bound of 1.
+def test_chunk_split_carries_no_core_divisibility(variants: list) -> None:
+    # maxpar splits the chunk loop over 10 cores on the 12x10 mesh; since
+    # phase G the cores need not divide the chunk count, so no placement
+    # constrains tile_c by the cores (exactness is checked below).
     assert variants
     for v in variants:
         tile_c = [d for d in _divisible(v) if '"tile_c"' in json.dumps(d)]
-        assert tile_c, (v.get("variant_name"), "no divisibility constraint on tile_c")
-        for d in tile_c:
-            assert d["x"] == {"Div": [{"Const": 10}, {"Sym": "tile_c"}]}, d
-            assert d["by"] == {"Const": 10}, d
+        assert not tile_c, (v.get("variant_name"), tile_c)
 
 
 def test_no_constraint_divides_an_extent_of_one(variants: list) -> None:

@@ -47,7 +47,8 @@ def test_explorer_places_presplit_axes_without_tiling() -> None:
     # The tuner's wave loop and recomposition survive untouched.
     assert out.count("loom.block_sym = @tile_m, loom.iter_type = #loom.iter_type<temporal>") == 2
     assert "affine.apply affine_map<(d0, d1) -> (d0 + d1 * 8)>" in out
-    assert "Divisible" in etg
+    # Cores need not divide tiles (phase G); the tile must still divide the extent.
+    assert "Divisible" not in etg and '"Eq"' in etg
 
 
 def test_explorer_rejects_axes_that_do_not_fit() -> None:
@@ -62,31 +63,37 @@ def test_explorer_rejects_axes_that_do_not_fit() -> None:
 
 def test_split_emits_a_constant_axis_and_a_wave_loop() -> None:
     # With a mesh every candidate is completed by maxpar, so the remaining
-    # axes are split too: m over 8 and n over 4 next to b's 2 (2*4 on x, 8 on y).
+    # axes are split too: m over 8 and n over 6 next to b's 2 (96 cores, the
+    # most that fit once b takes 2).
     result = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=fixed",
                   "options=split(b,2)", f"hw-spec={HW12x10}")
     assert result.returncode == 0, result.stderr[-2000:]
     out = result.stdout
-    assert re.search(r"affine\.parallel \(%\w+, %\w+, %\w+\) = \(0, 0, 0\) to \(8, 2, 4\)", out), out
+    assert re.search(r"affine\.parallel \(%\w+, %\w+, %\w+\) = \(0, 0, 0\) to \(8, 2, 6\)", out), out
     assert "loom.block_syms = [@tile_m, @tile_b, @tile_n]" in out
     assert "affine.apply" in out
     assert "loom.block_sym = @tile_b, loom.iter_type = #loom.iter_type<temporal>" in out
     assert "loom.block_sym = @tile_m, loom.iter_type = #loom.iter_type<temporal>" in out
 
 
-def test_split_needs_the_mesh_and_a_dividing_core_count() -> None:
+def test_split_needs_the_mesh_and_at_most_one_core_per_tile() -> None:
     no_mesh = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=fixed", "options=split(b,2)")
     assert no_mesh.returncode != 0 and "needs the mesh" in no_mesh.stderr
-    bad = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=fixed",
-               "options=split(b,3)", f"hw-spec={HW12x10}")
-    assert bad.returncode != 0 and "divide" in bad.stderr
+    # 3 cores do not divide b's 8 tiles: legal, the last wave is partial.
+    uneven = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=fixed",
+                  "options=split(b,3)", f"hw-spec={HW12x10}")
+    assert uneven.returncode == 0, uneven.stderr[-2000:]
+    # More cores than tiles leaves cores without work: refused.
+    too_many = tune(FIXTURES / "tune_scaled_ewise_p00.mlir", "policy=fixed",
+                    "options=split(b,9)", f"hw-spec={HW12x10}")
+    assert too_many.returncode != 0 and "tile count" in too_many.stderr
 
 
 @pytest.mark.parametrize("fixture, expected", [
-    ("tune_scaled_ewise_p00.mlir", "b8Sm8"),      # 64 cores: b on one dim, m on the other
-    ("tune_matmul_p00.mlir", "m8Sn8"),            # k carries the accumulator and stays
+    ("tune_scaled_ewise_p00.mlir", "b5Sm6Sn2Sn2"),  # 120 cores; 5 does not divide b's 8 tiles
+    ("tune_matmul_p00.mlir", "m12Sn10"),          # 120 cores; k carries the accumulator
     ("etg_mamba_p00.mlir", "c10Sm6Sn2"),          # the whole 12x10 mesh
-    ("tune_ewise3d_p00.mlir", "b2Sm8Sn4"),        # 2*4 = 8 on x, 8 on y
+    ("tune_ewise3d_p00.mlir", "b2Sm6Sn10"),       # 120 cores
     ("bind_attention_fullrow_p00.mlir", "m2Sm8"),  # one loop of 16 tiles spanning both dims
 ])
 def test_maxpar_fills_the_mesh(fixture: str, expected: str) -> None:
@@ -110,11 +117,13 @@ def test_beam_with_the_mesh_returns_distinct_presplit_trees() -> None:
     names = re.findall(r"func\.func @(\S+?)\(", result.stdout)
     assert len(names) == len(set(names)) and names, names
     assert result.stdout.count("loom.block_syms = [") == len(names)
-    # Trading cores for multicast: the head loop over 8 cores (cb and C are
-    # invariant in h) on 80 cores is rated below maxpar's 120-core tree.
+    # The head loop split (cb and C are shared by the heads of a group) is
+    # rated below maxpar's tree.
     estimates = [float(e) for e in re.findall(r"loop tree \(after, \S+ estimate ([0-9.e+]+)\)", result.stderr)]
     assert estimates and min(estimates) < 1.13e7, estimates
-    assert any("h8" in n for n in names), names
+    # Since phase G the head split need not divide the 32 heads (h12 on 120
+    # cores is reachable next to h8 on 80).
+    assert any("h8" in n or "h12" in n for n in names), names
 
 
 def test_temporalize_after_split_keeps_the_recomposition_on_its_axis() -> None:

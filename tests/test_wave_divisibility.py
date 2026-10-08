@@ -1,11 +1,11 @@
-"""Spatial splits must divide the loop they split.
+"""Spatial splits no longer need cores dividing tiles (phase G).
 
-A wave loop over a spatial split has no guard for a partial last wave, so
-the ETG constrains `extent / tile` to be divisible by the number of cores of
-every spatially split loop. maxpar splits `scaled_ewise` into b over 8 cores
-and m over 8 cores on the 12x10 mesh; every placement must carry a
-`Divisible` hard constraint per split axis with that axis's core count.
+A wave loop's last wave may be partial: `loom-partial-waves` guards or
+shadows the iterations past the end at materialization. The ETG therefore
+carries no `Divisible(tiles, cores)` constraint for a split loop; the tile
+must still divide its extent (an `Eq` constraint).
 """
+
 
 from __future__ import annotations
 
@@ -27,35 +27,15 @@ def presplit(p00: str) -> str:
     return loom_pipeline.run_mapping_tune(p00, "maxpar", "", False, str(HW_SPEC))
 
 
-def test_spatially_split_loops_carry_a_divisibility_constraint() -> None:
+def test_spatially_split_loops_carry_no_core_divisibility() -> None:
     if not HW_SPEC.exists():
         pytest.skip(f"hardware spec missing: {HW_SPEC}")
     _, etg_json = loom_pipeline.run_exploration(
         input_mlir=presplit(P00.read_text()), hw_spec_file=str(HW_SPEC), produce_etg=True
     )
     variants = json.loads(etg_json)
-    checked = 0
+    assert variants
     for variant in variants:
-        name = variant.get("variant_name") or variant.get("name") or ""
-        m = re.search(r"__x([\d]+)_y([\d]+)__", name) or re.search(r"__x([\dx]+)_y([\dy\d]+)__", name)
-        if not m:
-            continue
-        cores = 1
-        for part in (m.group(1), m.group(2)):
-            for f in re.findall(r"\d+", part):
-                cores *= int(f)
         constraints = variant["constraint_scope"]["hard_constraints"]
-        divisible = [c for c in constraints if "Divisible" in c]
-        if cores == 1:
-            assert not divisible, name
-            continue
-        checked += 1
-        assert divisible, f"{name}: no Divisible constraint for {cores} cores"
-        # One constraint per split axis: every factor in the name is the
-        # divisor of some constraint (b over 8 cores, m over 8 cores).
-        divisors = {json.dumps(c["Divisible"]["by"]) for c in divisible}
-        for part in (m.group(1), m.group(2)):
-            for f in re.findall(r"\d+", part):
-                if int(f) > 1:
-                    assert json.dumps({"Const": int(f)}) in divisors, (name, divisors)
-    assert checked > 0
+        assert not [c for c in constraints if "Divisible" in c], variant.get("variant_name")
+        assert [c for c in constraints if "Eq" in c], variant.get("variant_name")
