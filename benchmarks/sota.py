@@ -120,7 +120,7 @@ def gqa_decode_composite(ttnn, d, ins, shapes, params):
     def run():
         s = ttnn.matmul(q_tt, kt_tt, compute_kernel_config=ckc)
         s = ttnn.multiply(s, scale)
-        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc, numeric_stable=True)
         return ttnn.matmul(p, v_tt, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
@@ -137,7 +137,8 @@ def mask_softmax_fused(ttnn, d, ins, shapes, params):
     ckc = _ckc(ttnn, d, params)
 
     def run():
-        return ttnn.scale_mask_softmax_in_place(x_tt, scale, m_tt, is_causal_mask=True, compute_kernel_config=ckc)
+        return ttnn.scale_mask_softmax_in_place(x_tt, scale, m_tt, is_causal_mask=True, compute_kernel_config=ckc,
+                                                numeric_stable=True)
 
     out = ttnn.to_torch(run()).float()
     # In place: the timed runs re-normalize an already normalized tensor, which
@@ -156,7 +157,7 @@ def mask_softmax_composite(ttnn, d, ins, shapes, params):
     def run():
         s = ttnn.multiply(x_tt, scale)
         s = ttnn.add(s, m_tt)
-        return ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        return ttnn.softmax(s, dim=-1, compute_kernel_config=ckc, numeric_stable=True)
 
     return ttnn.to_torch(run()).float(), run, None
 
@@ -242,7 +243,7 @@ def mla_decode_composite(ttnn, d, ins, shapes, params):
     def run():
         s = ttnn.matmul(q_tt, kvt_tt, compute_kernel_config=ckc)
         s = ttnn.multiply(s, scale)
-        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc, numeric_stable=True)
         return ttnn.matmul(p, kv_tt, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
@@ -281,7 +282,7 @@ def gqa_prefill_composite(ttnn, d, ins, shapes, params):
     def run():
         s = ttnn.matmul(q_tt, kt_tt, compute_kernel_config=ckc)
         s = ttnn.multiply(s, scale)
-        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc)
+        p = ttnn.softmax(s, dim=-1, compute_kernel_config=ckc, numeric_stable=True)
         return ttnn.matmul(p, v_tt, compute_kernel_config=ckc)
 
     return ttnn.to_torch(run()).float(), run, None
