@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -441,7 +442,9 @@ def worker(program: str, baseline: str, shapes: list[list[int]], params: dict, i
         for _ in range(iters):
             t0 = time.perf_counter(); run(); ttnn.synchronize_device(d)
             ts.append(time.perf_counter() - t0)
-        print("RESULT " + json.dumps({"pcc": pcc, "device_ms": statistics.median(ts) * 1e3}), flush=True)
+        g = d.compute_with_storage_grid_size()
+        print("RESULT " + json.dumps({"pcc": pcc, "device_ms": statistics.median(ts) * 1e3,
+                                      "grid": [g.x, g.y]}), flush=True)
     finally:
         ttnn.close_device(d)
 
@@ -496,7 +499,14 @@ def main() -> None:
     ap.add_argument("--tag", default=None,
                     help="Loom result tag (test/bench/<program>/<tag>) whose shapes the baselines use; "
                          "only Loom rows of that shape are listed")
+    ap.add_argument("--grid", default=None, metavar="XxY",
+                    help="restrict ttnn to an X x Y compute grid (e.g. 12x10, Loom's hardware spec); "
+                         "results go to a file suffixed _g<XxY>")
     a = ap.parse_args()
+    if a.grid:
+        gx, gy = (int(v) for v in a.grid.lower().split("x"))
+        # Shrinks compute_with_storage_grid_size(), which every ttnn op sizes its work by.
+        os.environ["TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE"] = f"{gx - 1},{gy - 1}"
     params = dict(kv.split("=", 1) for kv in a.param)
     params["fidelity"], params["approx"] = a.fidelity, not a.no_approx
     pe = {"math_fidelity": a.fidelity, "math_approx_mode": not a.no_approx,
@@ -520,6 +530,8 @@ def main() -> None:
             if a.reset_each:
                 reset_board()
             r = run_baseline(a.program, name, shapes, {**params, **point}, a.iters, a.warmup, a.timeout)
+            if a.grid and "grid" in r and r["grid"] != [gx, gy]:
+                r = {"error": f"ran on a {r['grid'][0]}x{r['grid'][1]} grid, not {a.grid}"}
             label = _point_name(name, point) if (a.program, name) in SWEEPS else name
             rows.append({"name": label, "baseline": name, "program_config": point, **r})
     for l in loom:
@@ -540,9 +552,11 @@ def main() -> None:
         if ok:
             best = min(ok, key=lambda r: r["device_ms"])
             print(f"best {base}: {best['name']} {best['device_ms']:.3f} ms")
-    out = ROOT / "tmp_output/sota" / (f"{a.program}_{a.tag}.json" if a.tag else f"{a.program}_{a.fidelity}.json")
+    stem = f"{a.program}_{a.tag}" if a.tag else f"{a.program}_{a.fidelity}"
+    out = ROOT / "tmp_output/sota" / (f"{stem}_g{a.grid}.json" if a.grid else f"{stem}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"program": a.program, "shapes": shapes, "params": params, "pe_kernel": pe,
+                               "grid": a.grid,
                                "rows": rows}, indent=2))
     print(f"results: {out.relative_to(ROOT)}")
 
