@@ -2,7 +2,9 @@
 
 `Tuner::pickTiles` stands in for the solver's tile choice: each tile symbol
 starts at the largest multiple of 32 that divides its extent and leaves every
-core of a split loop a tile (tile * cores <= extent); while the L1 buffers
+core of a split loop a tile (tile * cores <= extent), or, on a split loop, at
+the largest tile whose padded work per core (whole waves) is within 25% of
+the least; while the L1 buffers
 (loads twice for double buffering, stores, compute temporaries) exceed one
 core's L1, the tile holding the most bytes steps down. More cores therefore
 mean smaller tiles and more traffic, which the estimate now sees.
@@ -30,9 +32,11 @@ def test_more_cores_leave_room_for_smaller_tiles_only() -> None:
     # shrinks until A, B (double buffered), C and the accumulator fit L1.
     tiles64, est64 = fixed("split(m,8);split(n,8)")
     assert tiles64 == "tile_k=512 tile_m=256 tile_n=256", tiles64
-    # On 12 x 10 cores m and n stop at 128 (2048 / 12 and 2048 / 10).
+    # On 12 x 10 cores m and n stop at 128 (2048 / 12 and 2048 / 10). On m,
+    # 16 tiles over 12 cores pad every core to 2 x 128 rows where 64-row
+    # tiles need 3 x 64, so m takes 64; on n, 128 and 64 pad alike.
     tiles120, est120 = fixed("split(m,12);split(n,10)")
-    assert tiles120 == "tile_k=1024 tile_m=128 tile_n=128", tiles120
+    assert tiles120 == "tile_k=1024 tile_m=64 tile_n=128", tiles120
     # Half the tile edge doubles the refetches of A and B.
     assert est64 < est120, (est64, est120)
 
