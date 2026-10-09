@@ -43,6 +43,26 @@ def container(cmd: str, timeout: int = 1800) -> subprocess.CompletedProcess:
     return subprocess.run(CONTAINER + [cmd], capture_output=True, text=True, timeout=timeout)
 
 
+def beam_trace(out: Path, log: str) -> dict[str, str]:
+    """Write the beam's trace (`trace=1`) to <out>/beam_trace.txt and return
+    order signature -> move path for the trees it returned."""
+    lines, paths, keep = [], {}, False
+    for line in log.splitlines():
+        if line.startswith("beam: "):
+            keep = True
+        elif not line.startswith("  "):
+            keep = False
+        if not keep:
+            continue
+        lines.append(line)
+        m = re.match(r"\s+#\d+ estimate \S+\s+work \S+\s+(.*?)  -> (\S+)$", line)
+        if m:
+            paths[m.group(2)] = m.group(1)
+    if lines:
+        (ROOT / out / "beam_trace.txt").write_text("\n".join(lines) + "\n")
+    return paths
+
+
 def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
                     topk: int, njobs: int, hoist: bool = False,
                     prog: Program | None = None, per_order: int | None = None) -> tuple[Path, str]:
@@ -50,6 +70,8 @@ def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
     out = Path("test/bench") / name / tag
     shape = f"-{prog.shape} " if prog.shape else ""
     tune_args = f"--tune {tune} " if tune else ""
+    if tune == "beam" and "trace=" not in tune_options:
+        tune_options = f"{tune_options};trace=1" if tune_options else "trace=1"
     if tune and tune_options:
         tune_args += f"--tune-options '{tune_options}' "
     if tune and hoist:
@@ -268,10 +290,15 @@ def main() -> None:
     ranks = parse_solver(out)
     estimates = tune_estimates(out)
     funcs = p03_functions(out)
-    print(f"compiled: {len(funcs)} candidate(s)")
+    paths = beam_trace(out, log)
+    print(f"compiled: {len(funcs)} candidate(s)" + (f"; beam trace: {out}/beam_trace.txt" if paths else ""))
     for i, func in enumerate(funcs, start=1):
         base = func.split("__is_double_buffer")[0]
         row = {"function": func, "T_total": ranks.get(base), "estimate": estimates.get(func)}
+        sig = re.search(r"__order_(.+?)__x", base)
+        if sig and sig.group(1) in paths:
+            row["path"] = paths[sig.group(1)]
+            print(f"[{i}] moves: {row['path']}")
         kdir = Path("tmp_output/bench") / a.program / tag / f"f{i}"
         t1 = time.perf_counter()
         err = "" if a.reuse and (ROOT / kdir / "compute.cpp").exists() else lower(out, i, kdir)
