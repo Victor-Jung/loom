@@ -78,7 +78,8 @@ def compile_program(name: str, tag: str, tune: str | None, tune_options: str,
         tune_args += "--tune-hoist "
     if per_order:
         tune_args += f"--topk-per-order {per_order} "
-    cmd = (f"rm -rf {out} && env -u VIRTUAL_ENV uv run python -u {prog.kernel} {shape}"
+    rank = f"LOOM_RANK={os.environ['LOOM_RANK']} " if os.environ.get("LOOM_RANK") else ""
+    cmd = (f"rm -rf {out} && {rank}env -u VIRTUAL_ENV uv run python -u {prog.kernel} {shape}"
            f"--config {prog.config} --output-path {out} --debug --njobs {njobs} "
            f"--topk-candidates {topk} {tune_args}")
     res = container(cmd)
@@ -283,6 +284,8 @@ def main() -> None:
     ap.add_argument("--timing", default="trace", choices=TIMINGS,
                     help="trace: replay a captured ttnn trace (default, no host dispatch in the samples); "
                          "batch: several launches per synchronization; sync: one launch per synchronization")
+    ap.add_argument("--select", default="none", choices=["none", "halving"],
+                    help="halving: successive halving over the compiled candidates (measurement in the loop)")
     ap.add_argument("--per-sample", type=int, default=20,
                     help="launches per timing sample for trace and batch")
     ap.add_argument("--warmup", type=int, default=3)
@@ -340,12 +343,13 @@ def main() -> None:
     for i, func in enumerate(funcs, start=1):
         base = func.split("__is_double_buffer")[0]
         row = {"function": func, "T_total": ranks.get(base), "estimate": estimates.get(func),
-               "terms": terms.get(func)}
+               "terms": terms.get(func), "index": i}
         sig = re.search(r"__order_(.+?)__x", base)
         if sig and sig.group(1) in paths:
             row["path"] = paths[sig.group(1)]
             print(f"[{i}] moves: {row['path']}")
         kdir = Path("tmp_output/bench") / a.program / tag / f"f{i}"
+        row["kdir"] = str(kdir)
         t1 = time.perf_counter()
         err = "" if a.reuse and (ROOT / kdir / "compute.cpp").exists() else lower(out, i, kdir)
         row["lower_s"] = round(time.perf_counter() - t1, 1)
@@ -378,8 +382,43 @@ def main() -> None:
               f"device={ms:.3f} ms ±{100 * (res.get('spread') or 0) / 2:.1f}%  lower={row['lower_s']} s")
         rows.append(row)
 
+    if a.select == "halving":
+        summary["selected"] = successive_halving(a, rows, out, approx)
     (ROOT / out / "results.json").write_text(json.dumps({"summary": summary, "candidates": rows}, indent=2))
     print(f"results: {out}/results.json")
+
+
+def successive_halving(a, rows: list[dict], out: Path, approx: bool) -> dict | None:
+    """Measurement in the loop: keep the faster half of the candidates that
+    passed, re-time the survivors in fresh processes with twice the samples,
+    and repeat until one is left. Every round's time is kept per candidate
+    (`rounds`); the selection is the last survivor."""
+    alive = [r for r in rows if r.get("stage") == "ok"]
+    if not alive:
+        return None
+    for r in alive:
+        r["rounds"] = [r["device_ms"]]
+    iters, rnd, t0 = a.iters, 1, time.perf_counter()
+    while len(alive) > 1:
+        alive.sort(key=lambda r: r["rounds"][-1])
+        alive = alive[:(len(alive) + 1) // 2]
+        if len(alive) == 1:
+            break
+        iters, rnd = iters * 2, rnd + 1
+        for r in alive:
+            res = run_candidate_in_process(a.program, Path(r["kdir"]), arg_shapes(out, r["function"]), iters,
+                                           a.warmup, a.timeout, a.fidelity, approx, a.timing, a.per_sample)
+            r["rounds"].append(res.get("device_ms", float("inf")))
+        print(f"round {rnd}: " + ", ".join(f"[{r['index']}] {r['rounds'][-1]:.3f}" for r in
+                                         sorted(alive, key=lambda r: r["rounds"][-1])))
+    best = min(alive, key=lambda r: r["rounds"][-1])
+    first = rows[0] if rows and rows[0].get("stage") == "ok" else None
+    sel = {"index": best["index"], "function": best["function"], "device_ms": best["rounds"][-1],
+           "rounds": rnd, "measure_s": round(time.perf_counter() - t0, 1),
+           "solver_first_ms": first["rounds"][-1] if first else None}
+    print(f"selected: [{best['index']}] {best['device_ms'] if rnd == 1 else best['rounds'][-1]:.3f} ms after {rnd} "
+          f"round(s)" + (f"; solver's first [1] {sel['solver_first_ms']:.3f} ms" if first else ""))
+    return sel
 
 
 if __name__ == "__main__":

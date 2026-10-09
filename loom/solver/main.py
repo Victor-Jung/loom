@@ -22,6 +22,7 @@ from ..loom_utils.ast import (
     parse_constraint,
 )
 from .core.solver_context import SolverContext
+from . import placement
 
 
 def solve_variant(
@@ -425,6 +426,14 @@ def run(
 
     # Rank solved candidates globally, then take the requested prefix directly.
     ranked_results = _rank_optimal_results(results)
+    if placement.enabled():
+        # Placement-aware order: the solver's T_total plus the placement the
+        # candidate name records (mesh dims, multicast per copy).
+        ranked_results = placement.rerank(
+            ranked_results,
+            lambda r: get_variant_name(r["variant"], r["index"]),
+            lambda r: r["min_val"],
+        )
     if topk_per_order is not None:
         # Keep the best K mapping variants of every tuner loop order (the
         # `__order_<sig>__` token the tuning pass puts in the function name),
