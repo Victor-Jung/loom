@@ -119,6 +119,15 @@ def tune_estimates(out: Path) -> dict[str, int]:
     return est
 
 
+def tune_terms(out: Path) -> dict[str, dict[str, float]]:
+    """Function name -> the tuner's cost terms (`loom.tune.terms`), when tuned."""
+    text = (ROOT / out / "IRs" / "p03_bufferized.mlir").read_text()
+    terms = {}
+    for m in re.finditer(r'func\.func @(\S+?)\(.*?\{(?:[^{}]*?)loom\.tune\.terms = "([^"]*)"', text, re.S):
+        terms[m.group(1)] = {k: float(v) for k, v in (kv.split("=") for kv in m.group(2).split(";"))}
+    return terms
+
+
 def lower(out: Path, index: int, kdir: Path) -> str:
     cmd = (f"rm -rf {kdir} tmp_output/mlir_{kdir.name} && "
            f"LOWER_MLIR_OUTPUT_DIR=$PWD/tmp_output/mlir_{kdir.name} SPLIT_KERNEL_OUTPUT_DIR=$PWD/{kdir} "
@@ -289,12 +298,14 @@ def main() -> None:
 
     ranks = parse_solver(out)
     estimates = tune_estimates(out)
+    terms = tune_terms(out)
     funcs = p03_functions(out)
     paths = beam_trace(out, log)
     print(f"compiled: {len(funcs)} candidate(s)" + (f"; beam trace: {out}/beam_trace.txt" if paths else ""))
     for i, func in enumerate(funcs, start=1):
         base = func.split("__is_double_buffer")[0]
-        row = {"function": func, "T_total": ranks.get(base), "estimate": estimates.get(func)}
+        row = {"function": func, "T_total": ranks.get(base), "estimate": estimates.get(func),
+               "terms": terms.get(func)}
         sig = re.search(r"__order_(.+?)__x", base)
         if sig and sig.group(1) in paths:
             row["path"] = paths[sig.group(1)]

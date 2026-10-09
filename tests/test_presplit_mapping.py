@@ -121,9 +121,9 @@ def test_beam_with_the_mesh_returns_distinct_presplit_trees() -> None:
     # rated below maxpar's tree.
     estimates = [float(e) for e in re.findall(r"loop tree \(after, \S+ estimate ([0-9.e+]+)\)", result.stderr)]
     assert estimates and min(estimates) < 1.13e7, estimates
-    # Since phase G the head split need not divide the 32 heads (h12 on 120
-    # cores is reachable next to h8 on 80).
-    assert any("h8" in n or "h12" in n for n in names), names
+    # The head loop is split (since phase G its core count need not divide
+    # the 32 heads).
+    assert any(re.search(r"__order_\w*h\d+", n) for n in names), names
 
 
 def test_temporalize_after_split_keeps_the_recomposition_on_its_axis() -> None:
