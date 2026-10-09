@@ -143,7 +143,18 @@ def arg_shapes(out: Path, func: str) -> list[list[int]]:
             for m in re.finditer(r"memref<([0-9x]+)x(?:f16|bf16|f32)>", sig)]
 
 
-def run_on_device(kdir: Path, shapes: list[list[int]], reference, iters: int, warmup: int):
+TIMINGS = ("trace", "batch", "sync")
+
+
+def run_on_device(kdir: Path, shapes: list[list[int]], reference, iters: int, warmup: int,
+                  timing: str = "trace", per: int = 20) -> dict:
+    """Run one candidate: PCC against the reference, then `iters` timing
+    samples. `sync` times one launch plus its synchronization per sample
+    (host dispatch and sync latency included); `batch` enqueues `per`
+    launches per synchronization; `trace` captures the launch in a ttnn
+    trace and replays it `per` times per synchronization (no host dispatch).
+    Returns pcc, the median ms per launch and the samples' relative spread
+    (interquartile range / median)."""
     import torch
     import ttnn
 
@@ -158,7 +169,7 @@ def run_on_device(kdir: Path, shapes: list[list[int]], reference, iters: int, wa
     torch.manual_seed(0)
     torch_in = {n: (torch.zeros(s) if n in outputs else torch.randn(s))
                 for n, s in zip(order, shapes)}
-    d = ttnn.open_device(device_id=0)
+    d = ttnn.open_device(device_id=0, trace_region_size=(8 << 20) if timing == "trace" else 0)
     try:
         dev = {n: ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=d,
                                   memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -181,13 +192,30 @@ def run_on_device(kdir: Path, shapes: list[list[int]], reference, iters: int, wa
         ref = reference(ins).float()
         pcc = torch.corrcoef(torch.stack([got.flatten(), ref.flatten()]))[0, 1].item()
 
+        launch = lambda: real(cap["io"], cap["prog"])
+        reps = 1 if timing == "sync" else per
+        if timing == "trace":
+            tid = ttnn.begin_trace_capture(d, cq_id=0)
+            launch()
+            ttnn.end_trace_capture(d, tid, cq_id=0)
+            launch = lambda: ttnn.execute_trace(d, tid, cq_id=0, blocking=False)
         for _ in range(warmup):
-            real(cap["io"], cap["prog"]); ttnn.synchronize_device(d)
+            for _ in range(reps):
+                launch()
+            ttnn.synchronize_device(d)
         ts = []
         for _ in range(iters):
-            t0 = time.perf_counter(); real(cap["io"], cap["prog"]); ttnn.synchronize_device(d)
-            ts.append(time.perf_counter() - t0)
-        return pcc, statistics.median(ts) * 1e3
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                launch()
+            ttnn.synchronize_device(d)
+            ts.append((time.perf_counter() - t0) / reps)
+        if timing == "trace":
+            ttnn.release_trace(d, tid)
+        ts.sort()
+        med = statistics.median(ts)
+        q1, q3 = ts[len(ts) // 4], ts[(3 * len(ts)) // 4]
+        return {"pcc": pcc, "device_ms": med * 1e3, "spread": (q3 - q1) / med, "timing": timing}
     finally:
         ttnn.close_device(d)
 
@@ -210,12 +238,13 @@ def pe_env(fidelity: str, approx: bool) -> dict:
 
 def run_candidate_in_process(program: str, kdir: Path, shapes: list[list[int]],
                              iters: int, warmup: int, timeout_s: int,
-                             fidelity: str = "HiFi4", approx: bool = True) -> dict:
+                             fidelity: str = "HiFi4", approx: bool = True,
+                             timing: str = "trace", per: int = 20) -> dict:
     """Run one candidate in a child process so a hung kernel cannot take the
     other candidates with it. On a timeout the child is killed and the board
     reset before the next candidate."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", program,
-           str(kdir), json.dumps(shapes), str(iters), str(warmup)]
+           str(kdir), json.dumps(shapes), str(iters), str(warmup), timing, str(per)]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=ROOT,
                              env=pe_env(fidelity, approx))
@@ -232,8 +261,9 @@ def run_candidate_in_process(program: str, kdir: Path, shapes: list[list[int]],
 
 def worker(argv: list[str]) -> None:
     program, kdir, shapes, iters, warmup = argv[0], Path(argv[1]), json.loads(argv[2]), int(argv[3]), int(argv[4])
-    pcc, ms = run_on_device(kdir, shapes, PROGRAMS[program].reference, iters, warmup)
-    print("RESULT " + json.dumps({"pcc": pcc, "device_ms": ms}), flush=True)
+    timing, per = (argv[5], int(argv[6])) if len(argv) > 6 else ("sync", 1)
+    res = run_on_device(kdir, shapes, PROGRAMS[program].reference, iters, warmup, timing, per)
+    print("RESULT " + json.dumps(res), flush=True)
 
 
 def main() -> None:
@@ -249,7 +279,12 @@ def main() -> None:
     ap.add_argument("--per-order", type=int, default=None,
                     help="keep at most K mapping variants per tuner loop order before the top-k cut")
     ap.add_argument("--njobs", type=int, default=4)
-    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--iters", type=int, default=20, help="timing samples per candidate")
+    ap.add_argument("--timing", default="trace", choices=TIMINGS,
+                    help="trace: replay a captured ttnn trace (default, no host dispatch in the samples); "
+                         "batch: several launches per synchronization; sync: one launch per synchronization")
+    ap.add_argument("--per-sample", type=int, default=20,
+                    help="launches per timing sample for trace and batch")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--tag", default=None, help="output sub-directory (default: policy name)")
     ap.add_argument("--shape", default=None, help="kernel-size override, e.g. K64_M256_N256")
@@ -328,7 +363,7 @@ def main() -> None:
         if a.reset_each:
             reset_board()
         res = run_candidate_in_process(a.program, kdir, arg_shapes(out, func), a.iters, a.warmup, a.timeout,
-                                       a.fidelity, approx)
+                                       a.fidelity, approx, a.timing, a.per_sample)
         if "error" in res:
             row.update(res)
             print(f"[{i}] {base[:60]}  run FAILED: {res['error'][:120]}")
@@ -336,10 +371,11 @@ def main() -> None:
             continue  # the board was reset; the next candidate gets a clean device
         pcc, ms = res["pcc"], res["device_ms"]
         ok = pcc >= prog.min_pcc
-        row.update(stage="ok" if ok else "pcc", pcc=pcc, device_ms=ms)
+        row.update(stage="ok" if ok else "pcc", pcc=pcc, device_ms=ms, spread=res.get("spread"),
+                   timing=res.get("timing"))
         est = f"  estimate={row['estimate']}" if row["estimate"] is not None else ""
         print(f"[{i}] {base[:70]}\n     T_total={row['T_total']}{est}  PCC={pcc:.6f} {'PASS' if ok else 'FAIL'}  "
-              f"device={ms:.3f} ms  lower={row['lower_s']} s")
+              f"device={ms:.3f} ms ±{100 * (res.get('spread') or 0) / 2:.1f}%  lower={row['lower_s']} s")
         rows.append(row)
 
     (ROOT / out / "results.json").write_text(json.dumps({"summary": summary, "candidates": rows}, indent=2))

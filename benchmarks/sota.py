@@ -424,6 +424,9 @@ def _pcc(a, b) -> float:
     return torch.corrcoef(torch.stack([a.flatten().float(), b.flatten().float()]))[0, 1].item()
 
 
+PER = 20  # launches per timing sample
+
+
 def worker(program: str, baseline: str, shapes: list[list[int]], params: dict, iters: int, warmup: int) -> None:
     import torch
     import ttnn
@@ -432,20 +435,36 @@ def worker(program: str, baseline: str, shapes: list[list[int]], params: dict, i
     # Same inputs as benchmarks/run.py: randn per input in argument order.
     ins = [torch.randn(s) for s in shapes[:-1]]
     ref = prog.reference([t.float() for t in ins]).float()
-    d = ttnn.open_device(device_id=0)
+    d = ttnn.open_device(device_id=0, trace_region_size=64 << 20)
     try:
         out, run, pcc_fn = BASELINES[program][baseline](ttnn, d, ins, shapes, params)
         ttnn.synchronize_device(d)
         pcc = pcc_fn(ref) if pcc_fn else _pcc(out, ref)
+        # Same timing as benchmarks/run.py: replay a captured trace PER times
+        # per synchronization (no host dispatch in the samples); ops that
+        # cannot be traced fall back to PER plain launches per synchronization.
+        timing, launch = "trace", None
+        try:
+            tid = ttnn.begin_trace_capture(d, cq_id=0)
+            run()
+            ttnn.end_trace_capture(d, tid, cq_id=0)
+            launch = lambda: ttnn.execute_trace(d, tid, cq_id=0, blocking=False)
+        except Exception:
+            timing, launch = "batch", run
         for _ in range(warmup):
-            run(); ttnn.synchronize_device(d)
+            for _ in range(PER):
+                launch()
+            ttnn.synchronize_device(d)
         ts = []
         for _ in range(iters):
-            t0 = time.perf_counter(); run(); ttnn.synchronize_device(d)
-            ts.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            for _ in range(PER):
+                launch()
+            ttnn.synchronize_device(d)
+            ts.append((time.perf_counter() - t0) / PER)
         g = d.compute_with_storage_grid_size()
         print("RESULT " + json.dumps({"pcc": pcc, "device_ms": statistics.median(ts) * 1e3,
-                                      "grid": [g.x, g.y]}), flush=True)
+                                      "grid": [g.x, g.y], "timing": timing}), flush=True)
     finally:
         ttnn.close_device(d)
 
