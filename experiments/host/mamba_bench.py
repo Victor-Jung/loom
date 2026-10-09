@@ -13,6 +13,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--ir", required=True)
 ap.add_argument("--kernels", required=True)
 ap.add_argument("--iters", type=int, default=20)
+ap.add_argument("--timing", default="trace", choices=["trace", "sync"],
+                help="trace: replay a captured trace 20 times per sample (as benchmarks/run.py); sync: one launch per sample")
 ap.add_argument("--warmup", type=int, default=5)
 a = ap.parse_args()
 
@@ -27,7 +29,7 @@ need_y = int(re.search(r"^\s*end_core_y = (\d+)$", text, re.M).group(1)) + 1
 spec = importlib.util.spec_from_file_location("loom_host_ttnn", host_py)
 h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 
-d = ttnn.open_device(device_id=0)
+d = ttnn.open_device(device_id=0, trace_region_size=8 << 20)
 try:
     g = d.compute_with_storage_grid_size()
     if need_x > g.x or need_y > g.y:
@@ -49,15 +51,26 @@ try:
     if 'prog' not in cap:
         raise SystemExit("failed to capture ProgramDescriptor")
 
+    per = 20 if a.timing == "trace" else 1
     def bench(fn, iters, warmup):
-        for _ in range(warmup): fn(); ttnn.synchronize_device(d)
+        for _ in range(warmup):
+            for _ in range(per): fn()
+            ttnn.synchronize_device(d)
         ts = []
         for _ in range(iters):
-            t0 = time.perf_counter(); fn(); ttnn.synchronize_device(d)
-            ts.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            for _ in range(per): fn()
+            ttnn.synchronize_device(d)
+            ts.append((time.perf_counter() - t0) / per)
         return st.median(ts), st.pstdev(ts)
 
-    t_dev, s_dev = bench(lambda: ttnn.generic_op(cap['io'], cap['prog']), a.iters, a.warmup)
+    launch = lambda: ttnn.generic_op(cap['io'], cap['prog'])
+    if a.timing == "trace":
+        tid = ttnn.begin_trace_capture(d, cq_id=0)
+        launch()
+        ttnn.end_trace_capture(d, tid, cq_id=0)
+        launch = lambda: ttnn.execute_trace(d, tid, cq_id=0, blocking=False)
+    t_dev, s_dev = bench(launch, a.iters, a.warmup)
     cores = need_x * need_y
     print(f"GRID {need_x}x{need_y} = {cores} cores   "
           f"device {t_dev*1e3:9.3f} ms  (sd {s_dev*1e3:.3f})   "
