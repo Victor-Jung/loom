@@ -366,8 +366,10 @@ def main() -> None:
             continue
         if a.reset_each:
             reset_board()
+        t2 = time.perf_counter()
         res = run_candidate_in_process(a.program, kdir, arg_shapes(out, func), a.iters, a.warmup, a.timeout,
                                        a.fidelity, approx, a.timing, a.per_sample)
+        row["run_s"] = round(time.perf_counter() - t2, 1)
         if "error" in res:
             row.update(res)
             print(f"[{i}] {base[:60]}  run FAILED: {res['error'][:120]}")
@@ -384,7 +386,18 @@ def main() -> None:
 
     if a.select == "halving":
         summary["selected"] = successive_halving(a, rows, out, approx)
+    # Where the wall time went: compile, lowering and first timing of the
+    # candidates, the halving rounds.
+    lower_s = round(sum(r.get("lower_s", 0) for r in rows), 1)
+    run_s = round(sum(r.get("run_s", 0) for r in rows), 1)
+    halving_s = (summary.get("selected") or {}).get("measure_s", 0.0)
+    total_s = round(time.perf_counter() - t0, 1)
+    summary["times_s"] = {"compile": round(compile_s, 1), "lower": lower_s, "run": run_s,
+                          "halving": halving_s, "total": total_s}
     (ROOT / out / "results.json").write_text(json.dumps({"summary": summary, "candidates": rows}, indent=2))
+    print(f"time: total {total_s:.0f} s = compile {compile_s:.0f} + lower {lower_s:.0f} + "
+          f"run {run_s:.0f} ({len(rows)} candidates) + halving {halving_s:.0f} + other "
+          f"{total_s - compile_s - lower_s - run_s - halving_s:.0f}")
     print(f"results: {out}/results.json")
 
 
