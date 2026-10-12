@@ -1,9 +1,10 @@
 """Benchmark table: Loom against ttnn on every program with a baseline.
 
 Loom: the halving selection (or the best passing candidate) of a run.py
-result tag. ttnn: the newest `tmp_output/sota/<program>_*_g<grid>.json` that
-sota.py wrote for the program; per kind (fused or single op, composite) the
-fastest config with PCC >= 0.99.
+result tag. ttnn: the newest `tmp_output/sota/<program>_*_g<grid>.json` of the same
+argument shapes; the fastest passing config (PCC >= 0.99) that launches a
+single device operation per call, and the fastest that launches several
+(op counts from ttnn graph capture, recorded by sota.py).
 
     python benchmarks/table.py --tag rsloop [--grid 12x10]
 """
@@ -47,21 +48,27 @@ def loom_runs(tag: str) -> list[tuple[str, list[list[int]], float]]:
     return out
 
 
-def ttnn_best(program: str, shapes: list[list[int]], grid: str) -> dict[str, float]:
-    """Fastest passing config per kind in the newest sota file of these shapes."""
+def ttnn_best(program: str, shapes: list[list[int]], grid: str) -> dict[str, tuple[float, int]]:
+    """Fastest passing config per kind in the newest sota file of these shapes:
+    "fused" when one call launches a single device operation (counted by graph
+    capture, `device_ops`), "multi" otherwise; values are (ms, op count)."""
     files = sorted(glob.glob(str(ROOT / "tmp_output/sota" / f"{program}_*_g{grid}.json")),
                    key=os.path.getmtime)
     for f in reversed(files):
         data = json.load(open(f))
         if data.get("shapes") != shapes:
             continue
-        best: dict[str, float] = {}
+        best: dict[str, tuple[float, int]] = {}
         for r in data["rows"]:
             base = r.get("baseline")
             if not base or "device_ms" not in r or r.get("pcc", 0) < 0.99 or "reference" in base:
                 continue
-            kind = "composite" if "composite" in base else "fused"
-            best[kind] = min(best.get(kind, math.inf), r["device_ms"])
+            ops = r.get("device_ops")
+            if ops is None:
+                continue  # measured before op counting: cannot tell fused from not
+            kind = "fused" if len(ops) == 1 else "multi"
+            if kind not in best or r["device_ms"] < best[kind][0]:
+                best[kind] = (r["device_ms"], len(ops))
         return best
     return {}
 
@@ -71,25 +78,27 @@ def main() -> None:
     ap.add_argument("--tag", default="rsloop")
     ap.add_argument("--grid", default="12x10")
     a = ap.parse_args()
-    print("| program | shape | Loom | ttnn fused / op | ttnn composite | Loom / fused | Loom / composite |")
+    print("| program | shape | Loom | ttnn single op | ttnn multi-op (ops) | Loom / single | Loom / multi |")
     print("|---|---|---|---|---|---|---|")
     ratios_f, ratios_c = [], []
     for p, shapes, lm in loom_runs(a.tag):
         best = ttnn_best(p, shapes, a.grid)
         if not best:
             continue
-        f, c = best.get("fused"), best.get("composite")
+        f = best["fused"][0] if "fused" in best else None
+        c = best["multi"][0] if "multi" in best else None
         cell = lambda v: f"{v:.3f}" if v is not None else "--"
         rf = lm / f if f else None
         rc = lm / c if c else None
         if rf: ratios_f.append(rf)
         if rc: ratios_c.append(rc)
         shape = " ".join("x".join(map(str, s)) for s in shapes[:-1])
-        print(f"| {p} | {shape} | {cell(lm)} | {cell(f)} | {cell(c)} | {cell(rf)} | {cell(rc)} |")
+        cm = f"{cell(c)} ({best['multi'][1]})" if c else "--"
+        print(f"| {p} | {shape} | {cell(lm)} | {cell(f)} | {cm} | {cell(rf)} | {cell(rc)} |")
     g = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs)) if xs else float("nan")
-    print(f"\nLoom / ttnn fused or op: geomean {g(ratios_f):.3f} over {len(ratios_f)}, "
+    print(f"\nLoom / ttnn single op: geomean {g(ratios_f):.3f} over {len(ratios_f)}, "
           f"Loom faster on {sum(r < 1 for r in ratios_f)}; "
-          f"Loom / composite: geomean {g(ratios_c):.3f} over {len(ratios_c)}, faster on {sum(r < 1 for r in ratios_c)}")
+          f"Loom / ttnn multi-op: geomean {g(ratios_c):.3f} over {len(ratios_c)}, faster on {sum(r < 1 for r in ratios_c)}")
 
 
 if __name__ == "__main__":

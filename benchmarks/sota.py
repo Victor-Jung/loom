@@ -523,13 +523,87 @@ def swiglu_composite(ttnn, d, ins, shapes, params):
                    ttnn, d, ins, params)
 
 
+def _mm2d_cfg(ttnn, m: int, n: int, k: int, params: dict, act=None, fuse_batch: bool = False):
+    """2-D multicast matmul program config for an [m, k] x [k, n] matmul on a
+    gx x gy grid (params gx, gy, bw = in0_block_w), the largest output
+    subblock (h * w <= 8) dividing the per-core block, and an optional fused
+    activation (applied in the matmul kernel together with the bias)."""
+    mt, nt, kt = m // 32, n // 32, k // 32
+    gx, gy, bw = params["gx"], params["gy"], params["bw"]
+    pm, pn = -(-mt // gy), -(-nt // gx)
+    sub = max(((h, w) for h in range(1, pm + 1) for w in range(1, pn + 1)
+               if pm % h == 0 and pn % w == 0 and h * w <= 8), key=lambda s: (s[0] * s[1], s[1]))
+    if kt % bw:
+        raise ValueError(f"in0_block_w {bw} does not divide {kt} k tiles")
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(gx, gy), in0_block_w=bw, out_subblock_h=sub[0],
+        out_subblock_w=sub[1], per_core_M=pm, per_core_N=pn, transpose_mcast=False,
+        fused_activation=act, fuse_batch=fuse_batch)
+
+
+def matmul_2d_tuned(ttnn, d, ins, shapes, params):
+    """ttnn.matmul with a 2-D multicast program config (batch folded into M
+    when only the activation is batched)."""
+    a, b = ins
+    m = math.prod(a.shape[:-1])
+    cfg = _mm2d_cfg(ttnn, m, b.shape[-1], a.shape[-1], params, fuse_batch=a.dim() > 2)
+    return _simple(lambda t, x, c: t.matmul(x[0], x[1], program_config=cfg, compute_kernel_config=c),
+                   ttnn, d, ins, params)
+
+
+def matmul_1d_tuned(ttnn, d, ins, shapes, params):
+    """ttnn.matmul with a 1-D config: the activation multicast to every core,
+    each core a block of `pn` output tile columns (decode-shaped GEMMs)."""
+    a, b = ins
+    mt, nt, kt = a.shape[0] // 32, b.shape[1] // 32, a.shape[1] // 32
+    pn, bw = params["pn"], params["bw"]
+    sub_w = max(w for w in range(1, min(pn, 8) + 1) if pn % w == 0)
+    cfg = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(12, 10), in0_block_w=bw, out_subblock_h=1, out_subblock_w=sub_w,
+        per_core_M=mt, per_core_N=pn, fuse_batch=True, fused_activation=None, mcast_in0=True)
+    if kt % bw or -(-nt // pn) > 120:
+        raise ValueError("bad 1-D config")
+    return _simple(lambda t, x, c: t.matmul(x[0], x[1], program_config=cfg, compute_kernel_config=c),
+                   ttnn, d, ins, params)
+
+
+def gemm_bias_gelu_mcast(ttnn, d, ins, shapes, params):
+    """ttnn.linear with bias and GELU fused into the matmul kernel."""
+    x, w, bias = ins
+    cfg = _mm2d_cfg(ttnn, x.shape[0], w.shape[1], x.shape[1], params, (ttnn.UnaryOpType.GELU, True))
+    return _simple(lambda t, a, c: t.linear(a[0], a[1], bias=a[2], program_config=cfg, compute_kernel_config=c),
+                   ttnn, d, ins, params)
+
+
+def gemm_bias_exp_mcast(ttnn, d, ins, shapes, params):
+    """exp((x @ w + b) / 64) as one matmul: the constant scale folded into w and
+    b offline (not timed), bias and exp fused into the matmul kernel."""
+    import torch
+    x, w, bias = ins
+    golden = torch.exp((x.float() @ w.float() + bias.float()) / 64.0)
+    cfg = _mm2d_cfg(ttnn, x.shape[0], w.shape[1], x.shape[1], params, (ttnn.UnaryOpType.EXP, False))
+    return _simple(lambda t, a, c: t.linear(a[0], a[1], bias=a[2], program_config=cfg, compute_kernel_config=c),
+                   ttnn, d, [x, w / 64.0, bias / 64.0], params, golden=golden)
+
+
+def swiglu_mcast(ttnn, d, ins, shapes, params):
+    """The best ttnn has: the gate matmul with SiLU fused, the up matmul, the
+    product (no op computes two matmuls of one input)."""
+    x, wg, wu = ins
+    cfg = _mm2d_cfg(ttnn, x.shape[0], wg.shape[1], x.shape[1], params, ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU))
+    cfg_up = _mm2d_cfg(ttnn, x.shape[0], wu.shape[1], x.shape[1], params)
+    return _simple(lambda t, a, c: t.multiply(t.matmul(a[0], a[1], program_config=cfg, compute_kernel_config=c),
+                                              t.matmul(a[0], a[2], program_config=cfg_up, compute_kernel_config=c)),
+                   ttnn, d, ins, params)
+
+
 BASELINES = {
-    "gemm_longk": {"ttnn op": matmul_op},
-    "gemv_decode": {"ttnn op": matmul_op},
+    "gemm_longk": {"ttnn op": matmul_op, "ttnn op (tuned)": matmul_2d_tuned},
+    "gemv_decode": {"ttnn op": matmul_op, "ttnn op (tuned 1d)": matmul_1d_tuned},
     "moe_expert_bmm": {"ttnn op": matmul_op},
     "toy_bmm_full": {"ttnn op": matmul_op},
-    "shared_weight_bmm_full": {"ttnn op": matmul_op},
-    "transpose_matmul_full": {"ttnn op": transpose_matmul_op},
+    "shared_weight_bmm_full": {"ttnn op": matmul_op, "ttnn op (tuned)": matmul_2d_tuned},
+    "transpose_matmul_full": {"ttnn composite": transpose_matmul_op},
     "chain_fused_full": {"ttnn composite": chain_matmul_composite},
     "scaled_ewise_full": {"ttnn op": multiply_op},
     "bias_add_full": {"ttnn op": add_op},
@@ -542,8 +616,8 @@ BASELINES = {
     "row_center_full": {"ttnn composite": row_center_composite},
     "attention_fullrow_full": {"ttnn fused": attention_fullrow_fused, "ttnn composite": attention_fullrow_composite},
     "layernorm_residual": {"ttnn fused": layernorm_fused, "ttnn composite": layernorm_composite},
-    "gemm_bias_gelu": {"ttnn fused": gemm_bias_gelu_fused, "ttnn composite": gemm_bias_gelu_composite},
-    "swiglu": {"ttnn fused": swiglu_fused, "ttnn composite": swiglu_composite},
+    "gemm_bias_gelu": {"ttnn fused": gemm_bias_gelu_mcast, "ttnn composite": gemm_bias_gelu_composite},
+    "swiglu": {"ttnn partly fused": swiglu_mcast, "ttnn composite": swiglu_composite},
     "gqa_decode": {"ttnn fused": gqa_decode_fused, "ttnn composite": gqa_decode_composite},
     "mask_softmax": {"ttnn fused": mask_softmax_fused, "ttnn composite": mask_softmax_composite},
     "rmsnorm_residual": {"ttnn fused": rmsnorm_fused, "ttnn composite": rmsnorm_composite},
@@ -552,13 +626,24 @@ BASELINES = {
     "rotary": {"ttnn fused": rotary_fused, "ttnn composite": rotary_composite},
     # ttnn.linear cannot fuse exp as an activation ("Unsupported activation
     # function"), so the epilogue runs as separate ops.
-    "gemm_bias_exp_full": {"ttnn linear+bias, exp": gemm_bias_exp_fused, "ttnn composite": gemm_bias_exp_composite,
+    "gemm_bias_exp_full": {"ttnn fused (scale folded)": gemm_bias_exp_mcast,
+                           "ttnn composite": gemm_bias_exp_composite,
                            "ttnn linear+bias only (reference)": gemm_linear_only},
 }
 
 
 # Program-config sweep per fused operator: every point is run and reported.
+_MM_POINTS = [{"gx": gx, "gy": gy, "bw": bw} for gx, gy in ((12, 10), (8, 8), (8, 10), (12, 8))
+              for bw in (2, 4, 8, 16)]
+
 SWEEPS = {
+    ("gemm_bias_gelu", "ttnn fused"): _MM_POINTS,
+    ("gemm_bias_exp_full", "ttnn fused (scale folded)"): _MM_POINTS,
+    ("swiglu", "ttnn partly fused"): _MM_POINTS,
+    ("gemm_longk", "ttnn op (tuned)"): [{"gx": gx, "gy": gy, "bw": bw} for gx, gy in ((8, 8), (4, 8), (8, 4))
+                                        for bw in (4, 8, 16)],
+    ("shared_weight_bmm_full", "ttnn op (tuned)"): _MM_POINTS,
+    ("gemv_decode", "ttnn op (tuned 1d)"): [{"pn": pn, "bw": bw} for pn in (2, 4) for bw in (4, 8, 16)],
     ("gqa_decode", "ttnn fused"): [{}] + [{"k_chunk": k} for k in (64, 128, 256, 512)],
     ("mla_decode", "ttnn fused"): [{}] + [{"k_chunk": k} for k in (64, 128, 256)],
     ("gqa_prefill", "ttnn fused"): [{}] + [{"q_chunk": q, "k_chunk": k} for q in (64, 128, 256) for k in (64, 128, 256, 512)],
@@ -568,6 +653,10 @@ SWEEPS = {
 def _point_name(name: str, point: dict) -> str:
     if not point:
         return f"{name} (default cfg)"
+    if "gx" in point:
+        return f"{name} {point['gx']}x{point['gy']} bw{point['bw']}"
+    if "pn" in point:
+        return f"{name} pn{point['pn']} bw{point['bw']}"
     return name + " " + " ".join(f"{k.split('_')[0]}{v}" for k, v in point.items())
 
 
@@ -587,6 +676,26 @@ def _pcc(a, b) -> float:
 PER = 20  # launches per timing sample
 
 
+def device_ops(ttnn, run) -> list[str]:
+    """The device operations one call of `run` launches, in order (ttnn graph
+    capture of an untraced call). A baseline is fused only if this is one."""
+    ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+    try:
+        run()
+    finally:
+        graph = ttnn.graph.end_graph_capture()
+    names = [n.get("params", {}).get("name", "") for n in graph
+             if n.get("node_type") == "function_start"]
+    # Every device-op launch goes through a ttnn::prim::* call; the call
+    # after it names the operation (e.g. Matmul, BinaryNgDeviceOperation).
+    ops = []
+    for i, name in enumerate(names):
+        if name.startswith("ttnn::prim::"):
+            nxt = names[i + 1] if i + 1 < len(names) else name
+            ops.append(nxt if not nxt.startswith("ttnn::") else name)
+    return ops
+
+
 def worker(program: str, baseline: str, shapes: list[list[int]], params: dict, iters: int, warmup: int) -> None:
     import torch
     import ttnn
@@ -600,6 +709,8 @@ def worker(program: str, baseline: str, shapes: list[list[int]], params: dict, i
         out, run, pcc_fn = BASELINES[program][baseline](ttnn, d, ins, shapes, params)
         ttnn.synchronize_device(d)
         pcc = pcc_fn(ref) if pcc_fn else _pcc(out, ref)
+        ops = device_ops(ttnn, run)
+        ttnn.synchronize_device(d)
         # Same timing as benchmarks/run.py: replay a captured trace PER times
         # per synchronization (no host dispatch in the samples); ops that
         # cannot be traced fall back to PER plain launches per synchronization.
@@ -624,7 +735,8 @@ def worker(program: str, baseline: str, shapes: list[list[int]], params: dict, i
             ts.append((time.perf_counter() - t0) / PER)
         g = d.compute_with_storage_grid_size()
         print("RESULT " + json.dumps({"pcc": pcc, "device_ms": statistics.median(ts) * 1e3,
-                                      "grid": [g.x, g.y], "timing": timing}), flush=True)
+                                      "grid": [g.x, g.y], "timing": timing, "device_ops": ops}),
+              flush=True)
     finally:
         ttnn.close_device(d)
 
@@ -726,7 +838,9 @@ def main() -> None:
             print(f"{r['name']:<36} {'FAIL':>8}          {r['error'].splitlines()[0][:80] if r['error'] else ''}")
             continue
         pcc = f"{r['pcc']:.6f}" if "pcc" in r else ""
-        print(f"{r['name']:<36} {r['device_ms']:8.3f} {r['device_ms'] / roof_ms:7.2f} {pcc:>9}")
+        ops = r.get("device_ops")
+        opstr = f"  {len(ops)} op{'s' if len(ops) != 1 else ''}: {', '.join(ops)}" if ops is not None else ""
+        print(f"{r['name']:<36} {r['device_ms']:8.3f} {r['device_ms'] / roof_ms:7.2f} {pcc:>9}{opstr}")
     for base in BASELINES[a.program]:
         ok = [r for r in rows if r.get("baseline") == base and "device_ms" in r and r.get("pcc", 0) >= 0.99]
         if ok:
