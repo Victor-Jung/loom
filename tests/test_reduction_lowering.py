@@ -47,4 +47,25 @@ def test_rank2_row_reductions_lower_to_reduce_tile(compute_kernel: str) -> None:
 
 def test_softmax_epilogue_lowers(compute_kernel: str) -> None:
     assert "exp_tile" in compute_kernel
-    assert "unary_bcast<BroadcastType::COL>" in compute_kernel
+    # The row max and sum broadcasts are folded into their consumers: x - max
+    # and the multiply by 1 / sum read the reduced tile as an FPU broadcast
+    # operand, so no broadcast is materialized and the reciprocal runs once.
+    assert "unary_bcast" not in compute_kernel
+    assert compute_kernel.count("sub_tiles_bcast_cols(") == 1
+    assert compute_kernel.count("mul_tiles_bcast_cols(") == 1
+    assert compute_kernel.count("recip_tile(") == 1
+
+
+def test_softmax_epilogue_materializes_without_fpu_folding(tmp_path) -> None:
+    if not OPT.exists():
+        pytest.skip(f"tileloom_to_ttkernel_opt not built at {OPT}")
+    env = dict(os.environ,
+               TILELOOM_TO_TTKERNEL_OPTIONS="fpu-elementwise=false",
+               LOWER_MLIR_OUTPUT_DIR=str(tmp_path / "mlir"),
+               SPLIT_KERNEL_OUTPUT_DIR=str(tmp_path / "kernels"))
+    result = subprocess.run([str(LOWER), str(FIXTURE), "1"], capture_output=True,
+                            text=True, timeout=600, cwd=ROOT, env=env)
+    assert result.returncode == 0, (result.stdout + result.stderr)[-3000:]
+    kernel = (tmp_path / "kernels" / "compute.cpp").read_text()
+    assert "unary_bcast<BroadcastType::COL>" in kernel
+    assert "_tiles_bcast_cols(" not in kernel
