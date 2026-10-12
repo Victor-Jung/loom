@@ -383,7 +383,167 @@ def gemm_linear_only(ttnn, d, ins, shapes, params):
     return out, run, lambda _golden: _pcc(out, ref)
 
 
+# ---- Library programs and the new operators (2026-10-12) -------------------
+# One function per ttnn expression; `run` is what the timing replays. Where
+# ttnn has no fused operator for the computation, only the op-by-op
+# composite is listed; a single ttnn op is listed as "ttnn op".
+
+def _simple(fn, ttnn, d, ins, params, golden=None):
+    """Upload `ins`, time `fn(ttnn, tensors, ckc)`; PCC against `golden`
+    (or the program's reference) on the first result."""
+    tts = [_to_dev(ttnn, d, t) for t in ins]
+    ckc = _ckc(ttnn, d, params)
+
+    def run():
+        return fn(ttnn, tts, ckc)
+
+    out = ttnn.to_torch(run()).float()
+    return out, run, (lambda _ref: _pcc(out, golden)) if golden is not None else None
+
+
+def _softmax_composite_ops(ttnn, x, dim):
+    m = ttnn.max(x, dim=dim, keepdim=True)
+    e = ttnn.exp(ttnn.subtract(x, m))
+    return ttnn.multiply(e, ttnn.reciprocal(ttnn.sum(e, dim=dim, keepdim=True)))
+
+
+def matmul_op(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.matmul(a[0], a[1], compute_kernel_config=c), ttnn, d, ins, params)
+
+
+def transpose_matmul_op(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.matmul(a[0], a[1], transpose_a=True, compute_kernel_config=c),
+                   ttnn, d, ins, params)
+
+
+def chain_matmul_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.matmul(t.matmul(a[0], a[1], compute_kernel_config=c), a[2],
+                                            compute_kernel_config=c), ttnn, d, ins, params)
+
+
+def multiply_op(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.multiply(a[0], a[1]), ttnn, d, ins, params)
+
+
+def add_op(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.add(a[0], a[1]), ttnn, d, ins, params)
+
+
+def outer_scale_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.multiply(t.multiply(a[0], a[1]), a[2]), ttnn, d, ins, params)
+
+
+def batch_sum_op(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.sum(a[0], dim=0), ttnn, d, ins, params)
+
+
+def weighted_batch_sum_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.sum(t.multiply(a[0], a[1]), dim=0), ttnn, d, ins, params)
+
+
+def softmax_fused(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.softmax(a[0], dim=-1, compute_kernel_config=c, numeric_stable=True),
+                   ttnn, d, ins, params)
+
+
+def softmax_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: _softmax_composite_ops(t, a[0], -1), ttnn, d, ins, params)
+
+
+def col_softmax_composite(ttnn, d, ins, shapes, params):
+    """Softmax over dim 0: transpose, the fused row softmax, transpose back."""
+    return _simple(lambda t, a, c: t.transpose(
+        t.softmax(t.transpose(a[0], 0, 1), dim=-1, compute_kernel_config=c, numeric_stable=True), 0, 1),
+        ttnn, d, ins, params)
+
+
+def row_center_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.subtract(a[0], t.mean(a[0], dim=-1, keepdim=True)), ttnn, d, ins, params)
+
+
+def attention_fullrow_fused(ttnn, d, ins, shapes, params):
+    """SDPA on [1, 1, S, D] views; the program has no 1/sqrt(D) scale."""
+    import torch
+    q, k, v = ins
+    golden = torch.softmax(q.float() @ k.float().T, dim=-1) @ v.float()
+    qt, kt, vt = (_to_dev(ttnn, d, t.reshape(1, 1, *t.shape)) for t in (q, k, v))
+    ckc = _ckc(ttnn, d, params)
+
+    def run():
+        return ttnn.transformer.scaled_dot_product_attention(qt, kt, vt, is_causal=False, scale=1.0,
+                                                             compute_kernel_config=ckc)
+
+    out = ttnn.to_torch(run()).float().reshape(golden.shape)
+    return out, run, lambda _ref: _pcc(out, golden)
+
+
+def attention_fullrow_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.matmul(
+        t.softmax(t.matmul(a[0], a[1], transpose_b=True, compute_kernel_config=c), dim=-1,
+                  compute_kernel_config=c, numeric_stable=True), a[2], compute_kernel_config=c),
+        ttnn, d, ins, params)
+
+
+def layernorm_fused(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.layer_norm(a[0], epsilon=1e-5, weight=a[2], bias=a[3],
+                                                residual_input_tensor=a[1], compute_kernel_config=c),
+                   ttnn, d, ins, params)
+
+
+def layernorm_composite(ttnn, d, ins, shapes, params):
+    def fn(t, a, c):
+        h = t.add(a[0], a[1])
+        dlt = t.subtract(h, t.mean(h, dim=-1, keepdim=True))
+        var = t.mean(t.multiply(dlt, dlt), dim=-1, keepdim=True)
+        y = t.multiply(dlt, t.rsqrt(t.add(var, 1e-5)))
+        return t.add(t.multiply(y, a[2]), a[3])
+    return _simple(fn, ttnn, d, ins, params)
+
+
+def gemm_bias_gelu_fused(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.linear(a[0], a[1], bias=a[2], activation="gelu", compute_kernel_config=c),
+                   ttnn, d, ins, params)
+
+
+def gemm_bias_gelu_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.gelu(t.add(t.matmul(a[0], a[1], compute_kernel_config=c), a[2])),
+                   ttnn, d, ins, params)
+
+
+def swiglu_fused(ttnn, d, ins, shapes, params):
+    """The SiLU fused into the gate GEMM, the up GEMM, then the product."""
+    return _simple(lambda t, a, c: t.multiply(t.linear(a[0], a[1], activation="silu", compute_kernel_config=c),
+                                              t.matmul(a[0], a[2], compute_kernel_config=c)),
+                   ttnn, d, ins, params)
+
+
+def swiglu_composite(ttnn, d, ins, shapes, params):
+    return _simple(lambda t, a, c: t.multiply(t.silu(t.matmul(a[0], a[1], compute_kernel_config=c)),
+                                              t.matmul(a[0], a[2], compute_kernel_config=c)),
+                   ttnn, d, ins, params)
+
+
 BASELINES = {
+    "gemm_longk": {"ttnn op": matmul_op},
+    "gemv_decode": {"ttnn op": matmul_op},
+    "moe_expert_bmm": {"ttnn op": matmul_op},
+    "toy_bmm_full": {"ttnn op": matmul_op},
+    "shared_weight_bmm_full": {"ttnn op": matmul_op},
+    "transpose_matmul_full": {"ttnn op": transpose_matmul_op},
+    "chain_fused_full": {"ttnn composite": chain_matmul_composite},
+    "scaled_ewise_full": {"ttnn op": multiply_op},
+    "bias_add_full": {"ttnn op": add_op},
+    "outer_scale_full": {"ttnn composite": outer_scale_composite},
+    "batch_sum_full": {"ttnn op": batch_sum_op},
+    "weighted_batch_sum_full": {"ttnn composite": weighted_batch_sum_composite},
+    "row_softmax_full": {"ttnn fused": softmax_fused, "ttnn composite": softmax_composite},
+    "softmax_twopass_full": {"ttnn fused": softmax_fused, "ttnn composite": softmax_composite},
+    "col_softmax_full": {"ttnn composite": col_softmax_composite},
+    "row_center_full": {"ttnn composite": row_center_composite},
+    "attention_fullrow_full": {"ttnn fused": attention_fullrow_fused, "ttnn composite": attention_fullrow_composite},
+    "layernorm_residual": {"ttnn fused": layernorm_fused, "ttnn composite": layernorm_composite},
+    "gemm_bias_gelu": {"ttnn fused": gemm_bias_gelu_fused, "ttnn composite": gemm_bias_gelu_composite},
+    "swiglu": {"ttnn fused": swiglu_fused, "ttnn composite": swiglu_composite},
     "gqa_decode": {"ttnn fused": gqa_decode_fused, "ttnn composite": gqa_decode_composite},
     "mask_softmax": {"ttnn fused": mask_softmax_fused, "ttnn composite": mask_softmax_composite},
     "rmsnorm_residual": {"ttnn fused": rmsnorm_fused, "ttnn composite": rmsnorm_composite},

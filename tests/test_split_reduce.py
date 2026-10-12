@@ -66,3 +66,26 @@ def test_beam_offers_split_reductions_and_reduce_off_removes_them() -> None:
     assert re.search(r"splitreduce \d+", on.stderr), on.stderr[-1500:]
     off = tune(MATMUL, "policy=beam", f"options={opts};reduce=off", f"hw-spec={HW12x10}")
     assert off.returncode == 0 and "splitreduce" not in off.stderr
+
+
+GQA_DECODE = FIXTURES / "tune_gqa_decode_p00.mlir"
+
+
+def test_online_softmax_reduction_merges_max_sum_and_output() -> None:
+    # The KV loop carries (m, acc, l): m' = max(m, rowmax), acc' = acc *
+    # exp(m - m') + P V, l' = l * exp(m - m') + rowsum. Split over 4 cores,
+    # core 0 merges M = max_s m_s, w_s = exp(m_s - M), L = sum_s l_s w_s,
+    # ACC = sum_s acc_s w_s.
+    r = fixed(GQA_DECODE, "splitreduce(n,4)")
+    assert r.returncode == 0, r.stderr[-2000:]
+    ir = r.stdout
+    assert len(re.findall(r"loom\.gather .* to memref<4x", ir)) == 3, ir
+    merge = ir[ir.index("scf.if"):]
+    for op in ("arith.maximumf", "math.exp", "loom.broadcast", "arith.mulf", "arith.addf"):
+        assert op in merge, op
+
+
+def test_a_carried_value_without_a_known_merge_is_refused() -> None:
+    # A running product has no merge in the recogniser: refused, with a reason.
+    r = fixed(FIXTURES / "tune_product_reduce_p00.mlir", "splitreduce(k,2)")
+    assert r.returncode != 0 and "no known merge" in r.stderr, r.stderr[-1500:]

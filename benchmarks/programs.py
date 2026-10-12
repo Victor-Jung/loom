@@ -83,6 +83,21 @@ def _rotary(ins: list[torch.Tensor]) -> torch.Tensor:
     return x.float() * cos.float() + (x.float() @ rot.float()) * sin.float()
 
 
+def _layernorm_residual(ins: list[torch.Tensor]) -> torch.Tensor:
+    x, res, w, b = (t.float() for t in ins)
+    return torch.nn.functional.layer_norm(x + res, (x.shape[-1],), w.flatten(), b.flatten(), eps=1e-5)
+
+
+def _gemm_bias_gelu(ins: list[torch.Tensor]) -> torch.Tensor:
+    x, w, bias = (t.float() for t in ins)
+    return torch.nn.functional.gelu(x @ w + bias)
+
+
+def _swiglu(ins: list[torch.Tensor]) -> torch.Tensor:
+    x, wg, wu = (t.float() for t in ins)
+    return torch.nn.functional.silu(x @ wg) * (x @ wu)
+
+
 def _flash_attention(ins: list[torch.Tensor]) -> torch.Tensor:
     """ins in p03 order: K transposed [BH, d, L], V [BH, L, d], q [BH, L, d]."""
     kt, v, q = ins
@@ -91,6 +106,36 @@ def _flash_attention(ins: list[torch.Tensor]) -> torch.Tensor:
 
 
 PROGRAMS: dict[str, Program] = {
+    "layernorm_residual": Program(
+        kernel="kernels/layernorm_residual.py",
+        config="kernels/config_files/layernorm_residual.json",
+        reference=_layernorm_residual,
+        shape="M8192_N1024",
+    ),
+    "gemm_bias_gelu": Program(
+        kernel="kernels/gemm_bias_gelu.py",
+        config="kernels/config_files/gemm_bias_gelu.json",
+        reference=_gemm_bias_gelu,
+        shape="M4096_K1024_N4096",
+    ),
+    "swiglu": Program(
+        kernel="kernels/swiglu.py",
+        config="kernels/config_files/swiglu.json",
+        reference=_swiglu,
+        shape="M2048_K1024_N2048",
+    ),
+    "gemv_decode": Program(
+        kernel="kernels/matmul.py",
+        config="kernels/config_files/matmul_splitk.json",
+        reference=lambda ins: ins[0] @ ins[1],
+        shape="M32_K4096_N4096",
+    ),
+    "moe_expert_bmm": Program(
+        kernel="kernels/toy_bmm.py",
+        config="kernels/config_files/matmul_splitk.json",
+        reference=lambda ins: ins[0] @ ins[1],
+        shape="B8_M64_K2048_N1024",
+    ),
     "gemm_longk": Program(
         kernel="kernels/matmul.py",
         config="kernels/config_files/matmul_splitk.json",
