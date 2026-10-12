@@ -87,11 +87,22 @@ def _collect_iter_num_constraints(
     # A program without a sequential (reduction) loop has no seq_iter.
     seq_exprs = []
     seq_labels = []
-    raw_seq_iter = iter_num.get("seq_iter")
-    if raw_seq_iter is not None and raw_seq_iter[0] is not None:
-        seq_iter, _ = _unpack_iter_num(raw_seq_iter, "iter_num.seq_iter")
-        seq_exprs.append(seq_iter)
-        seq_labels.append("iter_num.seq_iter")
+    # `seq_iters` lists every sequential loop; older ETGs only carry the one
+    # `seq_iter`.
+    raw_seq_iters = iter_num.get("seq_iters")
+    if raw_seq_iters:
+        for i, raw in enumerate(raw_seq_iters):
+            if raw is None or raw[0] is None:
+                continue
+            seq_iter, _ = _unpack_iter_num(raw, f"iter_num.seq_iters[{i}]")
+            seq_exprs.append(seq_iter)
+            seq_labels.append(f"iter_num.seq_iters[{i}]")
+    else:
+        raw_seq_iter = iter_num.get("seq_iter")
+        if raw_seq_iter is not None and raw_seq_iter[0] is not None:
+            seq_iter, _ = _unpack_iter_num(raw_seq_iter, "iter_num.seq_iter")
+            seq_exprs.append(seq_iter)
+            seq_labels.append("iter_num.seq_iter")
     temp_exprs = []
     temp_labels = []
 

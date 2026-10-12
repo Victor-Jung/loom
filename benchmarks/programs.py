@@ -91,6 +91,17 @@ def _flash_attention(ins: list[torch.Tensor]) -> torch.Tensor:
 
 
 PROGRAMS: dict[str, Program] = {
+    "gemm_longk": Program(
+        kernel="kernels/matmul.py",
+        config="kernels/config_files/matmul_splitk.json",
+        reference=lambda ins: ins[0] @ ins[1],
+        shape="M256_K16384_N256",
+    ),
+    "matmul_splitk": Program(
+        kernel="kernels/matmul_splitk.py",
+        config="kernels/config_files/matmul_splitk.json",
+        reference=lambda ins: ins[0] @ ins[1],
+    ),
     "toy_bmm": Program(
         kernel="kernels/toy_bmm.py",
         config="kernels/config_files/toy_bmm.json",
@@ -273,6 +284,11 @@ PROGRAMS: dict[str, Program] = {
         config="kernels/config_files/mask_softmax.json",
         reference=_mask_softmax,
     ),
+    "mask_softmax_hoist": Program(
+        kernel="kernels/mask_softmax_hoist.py",
+        config="kernels/config_files/mask_softmax.json",
+        reference=_mask_softmax,
+    ),
     "rmsnorm_residual": Program(
         kernel="kernels/rmsnorm_residual.py",
         config="kernels/config_files/rmsnorm_residual.json",
@@ -292,8 +308,18 @@ PROGRAMS: dict[str, Program] = {
         config="kernels/config_files/gqa_prefill.json",
         reference=_gqa_prefill,
     ),
+    "gqa_prefill_qscale": Program(
+        kernel="kernels/gqa_prefill_qscale.py",
+        config="kernels/config_files/gqa_prefill.json",
+        reference=_gqa_prefill,
+    ),
     "rotary": Program(
         kernel="kernels/rotary.py",
+        config="kernels/config_files/rotary.json",
+        reference=_rotary,
+    ),
+    "rotary_hoist": Program(
+        kernel="kernels/rotary_hoist.py",
         config="kernels/config_files/rotary.json",
         reference=_rotary,
     ),
