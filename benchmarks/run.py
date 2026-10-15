@@ -15,6 +15,7 @@ median device time.
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.util
 import json
 import os
@@ -130,15 +131,40 @@ def tune_terms(out: Path) -> dict[str, dict[str, float]]:
 
 
 def lower(out: Path, index: int, kdir: Path) -> str:
-    cmd = (f"rm -rf {kdir} tmp_output/mlir_{kdir.name} && "
-           f"LOWER_MLIR_OUTPUT_DIR=$PWD/tmp_output/mlir_{kdir.name} SPLIT_KERNEL_OUTPUT_DIR=$PWD/{kdir} "
+    mdir = Path("tmp_output/mlir") / kdir.relative_to("tmp_output/bench")
+    cmd = (f"rm -rf {kdir} {mdir} && "
+           f"LOWER_MLIR_OUTPUT_DIR=$PWD/{mdir} SPLIT_KERNEL_OUTPUT_DIR=$PWD/{kdir} "
            f"./third_party/loom2ttkernel/lower.sh {out}/IRs/p03_bufferized.mlir {index}")
     res = container(cmd, timeout=1200)
     return res.stdout + res.stderr if res.returncode else ""
 
 
+def lower_all(out: Path, kroot: Path, indices: list[int], jobs: int) -> None:
+    """Lower candidates `indices` in one container, `jobs` at a time, into
+    <kroot>/f<i>. Each lowering's log goes to <kroot>/lower_logs/f<i>.log; its
+    intermediate MLIR is deleted once the kernels exist."""
+    logs = kroot / "lower_logs"
+    (ROOT / logs).mkdir(parents=True, exist_ok=True)
+    mroot = Path("tmp_output/mlir") / kroot.relative_to("tmp_output/bench")
+    one = (f"i=$0; k={kroot}/f$i; m={mroot}/f$i; rm -rf $k $m; "
+           f"LOWER_MLIR_OUTPUT_DIR=$PWD/$m SPLIT_KERNEL_OUTPUT_DIR=$PWD/$k "
+           f"./third_party/loom2ttkernel/lower.sh {out}/IRs/p03_bufferized.mlir $i > {logs}/f$i.log 2>&1 "
+           f"&& [ -f $k/compute.cpp ] && rm -rf $m")
+    listing = " ".join(str(i) for i in indices)
+    container(f"printf '%s\\n' {listing} | xargs -P {jobs} -n 1 sh -c '{one}'", timeout=48 * 3600)
+
+
+def write_results(out: Path, summary: dict, rows: list[dict]) -> None:
+    (ROOT / out / "results.json").write_text(json.dumps({"summary": summary, "candidates": rows}, indent=2))
+
+
+@functools.lru_cache(maxsize=4)
+def _p03_text(out: Path) -> str:
+    return (ROOT / out / "IRs" / "p03_bufferized.mlir").read_text()
+
+
 def arg_shapes(out: Path, func: str) -> list[list[int]]:
-    ir = (ROOT / out / "IRs" / "p03_bufferized.mlir").read_text()
+    ir = _p03_text(out)
     sig = re.search(rf"func\.func @{re.escape(func)}\(([^)]*)\)", ir).group(1)
     return [[int(d) for d in m.group(1).split("x")]
             for m in re.finditer(r"memref<([0-9x]+)x(?:f16|bf16|f32)>", sig)]
@@ -280,6 +306,8 @@ def main() -> None:
     ap.add_argument("--per-order", type=int, default=None,
                     help="keep at most K mapping variants per tuner loop order before the top-k cut")
     ap.add_argument("--njobs", type=int, default=4)
+    ap.add_argument("--lower-jobs", type=int, default=0,
+                    help="lower every candidate up front in one container, this many at a time")
     ap.add_argument("--iters", type=int, default=20, help="timing samples per candidate")
     ap.add_argument("--timing", default="trace", choices=TIMINGS,
                     help="trace: replay a captured ttnn trace (default, no host dispatch in the samples); "
@@ -340,7 +368,18 @@ def main() -> None:
     funcs = p03_functions(out)
     paths = beam_trace(out, log)
     print(f"compiled: {len(funcs)} candidate(s)" + (f"; beam trace: {out}/beam_trace.txt" if paths else ""))
+    kroot = Path("tmp_output/bench") / a.program / tag
+    if a.lower_jobs:
+        todo = [i for i in range(1, len(funcs) + 1)
+                if not (a.reuse and (ROOT / kroot / f"f{i}" / "compute.cpp").exists())]
+        t1 = time.perf_counter()
+        if todo:
+            lower_all(out, kroot, todo, a.lower_jobs)
+        summary["lower_all_s"] = round(time.perf_counter() - t1, 1)
+        print(f"lowered {len(todo)} candidate(s) in {summary['lower_all_s']:.0f} s, {a.lower_jobs} at a time")
     for i, func in enumerate(funcs, start=1):
+        if i % 25 == 0:
+            write_results(out, summary, rows)
         base = func.split("__is_double_buffer")[0]
         row = {"function": func, "T_total": ranks.get(base), "estimate": estimates.get(func),
                "terms": terms.get(func), "index": i}
@@ -348,10 +387,15 @@ def main() -> None:
         if sig and sig.group(1) in paths:
             row["path"] = paths[sig.group(1)]
             print(f"[{i}] moves: {row['path']}")
-        kdir = Path("tmp_output/bench") / a.program / tag / f"f{i}"
+        kdir = kroot / f"f{i}"
         row["kdir"] = str(kdir)
         t1 = time.perf_counter()
-        err = "" if a.reuse and (ROOT / kdir / "compute.cpp").exists() else lower(out, i, kdir)
+        if a.lower_jobs:
+            log_f = ROOT / kroot / "lower_logs" / f"f{i}.log"
+            err = "" if (ROOT / kdir / "compute.cpp").exists() else (
+                log_f.read_text() if log_f.exists() else "not lowered")
+        else:
+            err = "" if a.reuse and (ROOT / kdir / "compute.cpp").exists() else lower(out, i, kdir)
         row["lower_s"] = round(time.perf_counter() - t1, 1)
         if err or not (ROOT / kdir / "compute.cpp").exists():
             msg = next((l for l in err.splitlines() if "error" in l), err[-300:])
