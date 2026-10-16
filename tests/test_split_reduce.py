@@ -62,7 +62,7 @@ def test_axes_after_a_temporalized_one_keep_the_reduction_axis() -> None:
 def test_beam_offers_split_reductions_and_reduce_off_removes_them() -> None:
     opts = "width=6;depth=2;keep=6;trace=1"
     on = tune(MATMUL, "policy=beam", f"options={opts}", f"hw-spec={HW12x10}")
-    assert on.returncode == 0 and "splitreduce 1" not in on.stderr
+    assert on.returncode == 0 and not re.search(r"splitreduce 1\b", on.stderr)
     assert re.search(r"splitreduce \d+", on.stderr), on.stderr[-1500:]
     off = tune(MATMUL, "policy=beam", f"options={opts};reduce=off", f"hw-spec={HW12x10}")
     assert off.returncode == 0 and "splitreduce" not in off.stderr

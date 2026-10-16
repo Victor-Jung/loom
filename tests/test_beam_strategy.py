@@ -59,4 +59,6 @@ def test_candidates_carry_their_cost_terms() -> None:
     r = beam(MATMUL, "width=4;depth=2;keep=2")
     terms = re.findall(r'loom\.tune\.terms = "([^"]+)"', r.stdout)
     assert terms and all(set(dict(kv.split("=") for kv in t.split(";"))) ==
-                         {"dram", "core", "blocks", "mblocks", "work", "cores"} for t in terms), terms
+                         {"dram", "core", "blocks", "mblocks", "work", "cores",
+                              "dram_bytes", "dram_blocks", "core_bytes", "mreceivers",
+                              "compute_ns", "merge_ns", "bank_excess"} for t in terms), terms

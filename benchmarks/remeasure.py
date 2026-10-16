@@ -2,11 +2,13 @@
 """Re-time the best candidates of a results.json several times, interleaved.
 
 Takes the `--top` fastest candidates of a run (by first-round board time),
-plus every candidate whose loop tree matches a finalist of `--compare` runs
-(e.g. the beam's rsfpu2 run of the same program), and times each `--reps`
-times in fresh processes, round-robin across candidates so slow drift of the
-board hits all of them alike. A finalist whose tree the run lacks (a sampled
-run) is timed from its own run, in the same rounds, with origin "compare".
+plus every candidate that is the same variant (function name: loop tree,
+tiles and dataflow) as a finalist of `--compare` runs (e.g. the beam's rsfpu2
+run of the same program), and times each `--reps` times in fresh processes,
+round-robin across candidates so slow drift of the board hits all of them
+alike. A finalist the run lacks is timed from its own run, in the same
+rounds, with origin "compare": a variant of the same loop tree with other
+tiles or dataflow is another kernel.
 Writes remeasure.json next to results.json: per candidate the samples (the
 first-round time first), median, min and max.
 
@@ -41,7 +43,7 @@ def main() -> None:
     ap.add_argument("run", help="output directory holding results.json, e.g. test/bench/mask_softmax/exh")
     ap.add_argument("--top", type=int, default=50)
     ap.add_argument("--reps", type=int, default=5)
-    ap.add_argument("--compare", nargs="*", default=[], help="runs whose finalists' trees are also re-timed")
+    ap.add_argument("--compare", nargs="*", default=[], help="runs whose finalists are also re-timed")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--timeout", type=int, default=150)
     ap.add_argument("--fidelity", default="HiFi4")
@@ -51,9 +53,9 @@ def main() -> None:
     data = json.loads((ROOT / out / "results.json").read_text())
     ok = [r for r in data["candidates"] if r.get("stage") == "ok"]
     ok.sort(key=lambda r: r["device_ms"])
-    by_tree = {}
+    by_function = {}
     for r in ok:
-        by_tree.setdefault(tree_of(r["function"]), r)
+        by_function.setdefault(r["function"], r)
     # Candidates are keyed by (run, index): indices repeat across runs.
     # A merged run (benchmarks/merge_runs.py) records the batch each row came from.
     src = lambda r: Path(r.get("run", out))
@@ -64,11 +66,10 @@ def main() -> None:
         cdata = json.loads((ROOT / c / "results.json").read_text())
         sel = (cdata["summary"].get("selected") or {}).get("index")
         for r in cdata["candidates"]:
-            t = tree_of(r["function"])
             entry = {"run": c, "index": r["index"], "selected": r["index"] == sel}
-            if t in by_tree:
-                k = key(by_tree[t])
-                chosen.setdefault(k, by_tree[t])
+            if r["function"] in by_function:
+                k = key(by_function[r["function"]])
+                chosen.setdefault(k, by_function[r["function"]])
             elif r.get("stage") == "ok":
                 r = {**r, "run": c}
                 k = key(r)

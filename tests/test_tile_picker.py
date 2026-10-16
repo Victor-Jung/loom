@@ -20,25 +20,26 @@ HW12x10 = "third_party/loom-mlar/tests/2d_mesh/2d_mesh_torus_x12y10.mlir"
 
 
 def fixed(schedule: str) -> tuple[str, float]:
+    """Picked tiles and DRAM traffic (bytes) of the tree after `schedule`."""
     result = tune(MATMUL, "policy=fixed", f"options={schedule}", f"hw-spec={HW12x10}", "dump-tree")
     assert result.returncode == 0, result.stderr[-2000:]
     tiles = re.search(r"^picked tiles: (.*)$", result.stderr, re.M).group(1)
-    estimate = float(re.search(r"loop tree \(after, \S+ estimate ([0-9.e+]+)\)", result.stderr).group(1))
-    return tiles, estimate
+    dram = float(re.search(r"^cost terms: .*dram_bytes=([0-9.e+]+)", result.stderr, re.M).group(1))
+    return tiles, dram
 
 
 def test_more_cores_leave_room_for_smaller_tiles_only() -> None:
     # 2048 x 16384 @ 16384 x 2048. On 8 x 8 cores m and n may reach 256; k
     # shrinks until A, B (double buffered), C and the accumulator fit L1.
-    tiles64, est64 = fixed("split(m,8);split(n,8)")
+    tiles64, dram64 = fixed("split(m,8);split(n,8)")
     assert tiles64 == "tile_k=512 tile_m=256 tile_n=256", tiles64
     # On 12 x 10 cores m and n stop at 128 (2048 / 12 and 2048 / 10). On m,
     # 16 tiles over 12 cores pad every core to 2 x 128 rows where 64-row
     # tiles need 3 x 64, so m takes 64; on n, 128 and 64 pad alike.
-    tiles120, est120 = fixed("split(m,12);split(n,10)")
+    tiles120, dram120 = fixed("split(m,12);split(n,10)")
     assert tiles120 == "tile_k=1024 tile_m=64 tile_n=128", tiles120
     # Half the tile edge doubles the refetches of A and B.
-    assert est64 < est120, (est64, est120)
+    assert dram64 < dram120, (dram64, dram120)
 
 
 def test_bounds_option_restores_the_two_point_estimate() -> None:

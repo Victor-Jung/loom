@@ -160,26 +160,68 @@ def run_step_1_exploration(
     return explored_mlir, etg_json_text
 
 
-def run_step_2_etg_resolution(
+def prune_infeasible_variants(
     etg_json_text: str,
+    constraints_dir: Path,
+    debug: bool,
+    symbol_domains: dict[str, list[int]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, list[int]]]:
+    """Drop variants whose loop trip counts no block size can satisfy.
+
+    The solver would report these INFEASIBLE; removing them up front skips
+    their ETG resolution and solving. Returns the kept variants and the symbol
+    domains derived from all variants, which Step 3 must use so that pruning
+    cannot change the domains it would have derived.
+    """
+    from loom.loom_utils.modeling import derive_domains_from_etg  # noqa: PLC0415
+    from loom.solver import find_unsatisfiable_trip_count  # noqa: PLC0415
+
+    variants = json.loads(etg_json_text)
+    domains = {**derive_domains_from_etg(variants), **(symbol_domains or {})}
+    kept, pruned = [], []
+    for variant in variants:
+        reason = find_unsatisfiable_trip_count(variant, domains)
+        if reason is None:
+            kept.append(variant)
+        else:
+            pruned.append(f"{variant.get('variant_name', '?')}  {reason}")
+
+    logging.info(f"Pruned {len(pruned)}/{len(variants)} variant(s) with unsatisfiable trip counts.")
+    if debug and pruned:
+        (constraints_dir / "p01_pruned_variants.txt").write_text("\n".join(pruned) + "\n")
+    if not kept:
+        logging.error("All variants UNSAT. No feasible block sizes. Aborting.")
+        sys.exit(1)
+    return kept, domains
+
+
+def run_step_2_etg_resolution(
+    etg_variants: str | list[dict[str, Any]],
     njobs: int,
     constraints_dir: Path,
+    hw_spec: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Step 2: ETG resolution via MLAR Rust evaluator."""
+    """Step 2: ETG resolution via MLAR Rust evaluator.
+
+    The evaluator is the ``eval_system`` generated next to *hw_spec*, so the
+    cost model always matches the hardware description.
+    """
     logging.info("")
     logging.info("=" * 72)
     logging.info("STEP 2: ETG RESOLUTION (MLAR evaluator)")
     logging.info("=" * 72)
 
-    from loom.loom_utils.mlar import resolve_etg_variants  # noqa: PLC0415
+    from loom.loom_utils.mlar import find_evaluator, resolve_etg_variants  # noqa: PLC0415
     from loom.loom_utils.io import smart_json_dumps  # noqa: PLC0415
 
     resolved_etg = constraints_dir / "p02_resolved_etg.json"
+    evaluator = find_evaluator(hw_spec)
+    logging.info(f"  Evaluator : {evaluator}")
     logging.info(f"  Output : {resolved_etg}")
 
     with pipeline_timer("Step 2: ETG Resolution"):
-        variants = json.loads(etg_json_text)
-        resolved_variants = resolve_etg_variants(variants, njobs=njobs)
+        variants = json.loads(etg_variants) if isinstance(etg_variants, str) else etg_variants
+        resolved_variants = resolve_etg_variants(variants, njobs=njobs, evaluator_path=evaluator)
         resolved_etg.write_text(smart_json_dumps(resolved_variants))
 
     logging.info(f"ETG resolution complete. {len(resolved_variants)} variant(s) resolved.")
@@ -356,7 +398,7 @@ def run_pipeline(
     if has_assigned_block_size:
         if needs_manual_etg:
             resolved_variants = run_step_2_etg_resolution(
-                etg_json_text, njobs, constraints_dir
+                etg_json_text, njobs, constraints_dir, hw_spec
             )
             from loom.solver import (  # noqa: PLC0415
                 prepare_manual_block_sizes,
@@ -390,8 +432,12 @@ def run_pipeline(
         logging.info("=" * 72)
         logging.info("Skipped due to assigned_block_size override.")
     else:
-        # Step 2: ETG resolution
-        run_step_2_etg_resolution(etg_json_text, njobs, constraints_dir)
+        # Step 2: ETG resolution (of the variants that can be feasible)
+        variants, symbol_domains = prune_infeasible_variants(
+            etg_json_text, constraints_dir, debug, symbol_domains
+        )
+        run_step_2_etg_resolution(variants, njobs, constraints_dir, hw_spec)
+        del variants
 
         # Step 3: Solver
         resolved_etg_path = constraints_dir / "p02_resolved_etg.json"
